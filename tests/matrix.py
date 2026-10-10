@@ -142,7 +142,7 @@ def run_one(job):
 
 if __name__ == "__main__":
     fixtures = make_fixtures()
-    jobs = [(f, t) for f in fixtures for t in c.targets_for([str(f)]) if t != "crop"]  # crop: a window
+    jobs = [(f, t) for f in fixtures for t in c.targets_for([str(f)]) if t not in ("crop", "rotate")]  # the edit window
     print(f"{ROOT}\n{len(fixtures)} input files, {len(jobs)} conversions", flush=True)
     fails = []
     with ThreadPoolExecutor(4) as pool:

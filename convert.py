@@ -82,8 +82,9 @@ _PNGQUANT_MAX = {2: 95, 3: 85, 4: 70, 5: 50}
 # GIF level 1 is lossless frame optimisation; 2-5 add lossy LZW and fewer colours.
 _GIFSICLE = {1: [], 2: ["--lossy=80", "--colors", "192"], 3: ["--lossy=120", "--colors", "128"],
              4: ["--lossy=160", "--colors", "64"], 5: ["--lossy=200", "--colors", "32"]}
-SUBMENUS = {"compress": set(COMPRESS), "rescale": set(RESIZE)}
+SUBMENUS = {"compress": set(COMPRESS), "rescale": set(RESIZE), "edit": {"crop", "rotate"}}
 LABELS = {"half": "\u00bd", "third": "\u2153", "double": "2\u00d7", "clean": "CLEAN", "convert": "CONVERT", "crop": "CROP",
+          "edit": "EDIT", "rotate": "ROTATE",
           "rescale": "RESCALE", "compress": "COMPRESS", "back": "BACK",
           **{t: LEVEL_NAMES[n].upper() for t, n in COMPRESS.items()}}
 BASE = Path(__file__).resolve().parent
@@ -192,7 +193,7 @@ def targets_for(paths):
                     + (["clean"] if _cleanable(p) else []))
     common = [t for t in sets[0] if all(t in s for s in sets[1:])] if sets else []
     if len(paths) == 1 and _croppable(paths[0]):
-        common.append("crop")  # the crop tool: one image at a time
+        common += ["crop", "rotate"]  # the edit window: one image at a time
     return common
 
 
@@ -875,9 +876,10 @@ def crop_preview(src, work):
     return preview, (width, height)
 
 
-def crop(src, box, dest):
-    """Cut box = (x, y, width, height), in upright pixels, out of src and write it to
-    dest in dest's format, metadata stripped as always. dest may be src itself
+def crop(src, box, dest, turns=0, mirror=False):
+    """Cut box = (x, y, width, height), in upright pixels, out of src, then mirror it
+    left-right (if mirror) and turn it clockwise by turns quarter turns, and write it
+    to dest in dest's format, metadata stripped as always. dest may be src itself
     (the crop tool's Replace) or any existing file: it is swapped in atomically,
     keeping that file's permissions. Animated GIF/WebP keep every frame."""
     src = Path(src).absolute()
@@ -900,7 +902,8 @@ def crop(src, box, dest):
         animated = ext_of(src) in ("gif", "webp") and e in ("gif", "webp")
         read = str(image) if animated else f"{image}[0]"  # still targets: the first frame/page
         frames = ["-coalesce"] if animated else []
-        cut = ["-auto-orient", "-crop", f"{width}x{height}+{x}+{y}", "+repage"]
+        cut = ["-auto-orient", "-crop", f"{width}x{height}+{x}+{y}", "+repage",
+               *(["-flop"] if mirror else []), *(["-rotate", str(90 * (turns % 4))] if turns % 4 else [])]
         out = payload / f"cropped.{e}"  # fixed name: ImageMagick expands %d etc.
         if e in ("avif", "heic", "heif"):
             flat = work / "cropped.png"

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import zipfile
@@ -381,7 +382,8 @@ class RingMenuTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             png = self.make(tmp, "a.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x04\0\0\0\x03\0\x08\x02\0\0\0")
             obj = self.opened([png])
-            self.assertEqual(obj.targets, ["convert", "compress", "rescale", "crop", "clean"])
+            self.assertEqual(obj.targets, ["convert", "compress", "rescale", "edit", "clean"])
+            self.assertEqual(obj.menus["edit"], ["back", "crop", "rotate"])
             self.assertEqual(obj.menus["convert"][0], "back")
             self.assertIn("jpg", obj.menus["convert"])
             self.assertNotIn("png", obj.menus["convert"])
@@ -485,6 +487,61 @@ class CropTests(unittest.TestCase):
             apng = Path(tmp) / "anim.png"
             apng.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + bytes(17) + b"\0\0\0\x08acTL" + bytes(12))
             self.assertNotIn("crop", convert.targets_for([str(apng)]))
+            self.assertNotIn("rotate", convert.targets_for([str(apng)]))
+            self.assertIn("rotate", convert.targets_for([str(a)]))
+            self.assertNotIn("rotate", convert.targets_for([str(a), str(b)]))
+
+    def test_rotate_and_flip_after_the_crop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.png"  # 300x200, red block top-left
+            self.run_("magick", "-size", "300x200", "xc:white", "-fill", "red", "-draw", "rectangle 0,0 49,49", str(src))
+            def red_corner(out):
+                w, h = map(int, self.run_("magick", "identify", "-format", "%w %h", str(out)).split())
+                corners = {name: float(self.run_("magick", str(out), "-crop", f"1x1+{x}+{y}", "-format",
+                                                 "%[fx:r-g]", "info:"))
+                           for name, (x, y) in {"tl": (0, 0), "tr": (w - 1, 0), "bl": (0, h - 1),
+                                                "br": (w - 1, h - 1)}.items()}
+                return (w, h), max(corners, key=corners.get)
+            whole = (0, 0, 300, 200)
+            self.assertEqual(red_corner(convert.crop(src, whole, Path(tmp) / "r.png", turns=1)), ((200, 300), "tr"))
+            self.assertEqual(red_corner(convert.crop(src, whole, Path(tmp) / "l.png", turns=3)), ((200, 300), "bl"))
+            self.assertEqual(red_corner(convert.crop(src, whole, Path(tmp) / "h.png", mirror=True)), ((300, 200), "tr"))
+            # Mirror then a half turn is a vertical flip.
+            self.assertEqual(red_corner(convert.crop(src, whole, Path(tmp) / "v.png", turns=2, mirror=True)),
+                             ((300, 200), "bl"))
+
+    def test_every_frame_of_a_flip_draws(self):
+        # Halfway through, the fold is edge-on: a singular matrix cairo refuses.
+        import cairo
+        import crop
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 300, 300)
+        preview = cairo.ImageSurface(cairo.FORMAT_ARGB32, 40, 20)
+        for step in (crop.FLIP_H, crop.FLIP_V, crop.TURN_LEFT, crop.TURN_RIGHT):
+            for t in [n / 200 for n in range(201)]:
+                crop.draw_rotate(cairo.Context(surface), 300, 300, (40, 20), preview, crop.TURN_RIGHT, (step, t))
+        with unittest.mock.patch.object(crop, "ease", lambda t: 0.5):  # exactly edge-on
+            for step in (crop.FLIP_H, crop.FLIP_V):
+                crop.draw_rotate(cairo.Context(surface), 300, 300, (40, 20), preview, crop.IDENTITY, (step, 0.3))
+
+    def test_orientation_maths(self):
+        tree = ast.parse((ROOT / "crop.py").read_text())
+        keep = {"IDENTITY", "TURN_RIGHT", "TURN_LEFT", "FLIP_H", "FLIP_V", "mul", "turns_mirror"}
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in keep
+                 or isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) in keep]
+        ns = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "crop.py", "exec"), ns)
+        tm, mul = ns["turns_mirror"], ns["mul"]
+        self.assertEqual(tm(ns["IDENTITY"]), (0, False))
+        self.assertEqual(tm(ns["TURN_RIGHT"]), (1, False))
+        self.assertEqual(tm(ns["TURN_LEFT"]), (3, False))
+        self.assertEqual(tm(ns["FLIP_H"]), (0, True))
+        self.assertEqual(tm(ns["FLIP_V"]), (2, True))
+        # Turn right, then flip horizontally (as on screen): mirror first, then three quarter turns.
+        self.assertEqual(tm(mul(ns["FLIP_H"], ns["TURN_RIGHT"])), (3, True))
+        m = ns["IDENTITY"]
+        for _ in range(4):
+            m = mul(ns["TURN_LEFT"], m)
+        self.assertEqual(m, ns["IDENTITY"])
 
     def box(self):
         namespace = {"INSETS": (0, 0, 0, 0), "HANDLE": 14, "ZOOM_PIXEL": 24}

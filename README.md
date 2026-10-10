@@ -14,7 +14,7 @@ sub ring has a BACK petal.
 | **CONVERT** | Formats common to everything selected (see below) |
 | **COMPRESS** | Audio and images: LIGHT · MEDIUM · STRONG · HEAVY · MAX |
 | **RESCALE** | Images and video: ½ · ⅓ · 2×, offered according to the pixel size |
-| **CROP** | One image: opens the crop window |
+| **EDIT** | One image: CROP or ROTATE, each in the edit window |
 | **CLEAN** | Same file, every bit of metadata removed |
 
 To hold something else instead of Forward, open **Prism: Set Shortcut** from
@@ -54,16 +54,25 @@ notification says so.
 available. 2× is offered only up to 3000 px for images, and up to 1920 px for
 video so the result stays within 4K.
 
-## Crop
+## Edit: crop and rotate
 
-An ordinary window, so Hyprland tiles it. It has no title bar, and **Esc**
-closes it.
+CROP and ROTATE open the same window. It is an ordinary window, so Hyprland
+tiles it. It has no title bar, and **Esc** closes it.
+
+**Crop:**
 
 - **Drag** to draw the box, drag inside it to move it, and drag the orange
   handles to resize. A click outside the box selects the whole image again.
 - **Ctrl +**, **Ctrl −** and **Ctrl 0**, or **Ctrl+scroll**, zoom the view
   (the crop is not affected). **Scroll** or **middle-drag** pans.
-- **Copy** puts the crop on the clipboard (`wl-copy`) and leaves the window open.
+
+**Rotate:** the toolbar buttons, or **[** and **]**, turn the image left and
+right a quarter turn; **H** and **V** flip it. The size shows what will be
+written.
+
+**Both** end with the same three buttons:
+
+- **Copy** puts the result on the clipboard (`wl-copy`) and leaves the window open.
 - **Save** opens the xdg-desktop-portal save dialog. A different extension
   saves in that format.
 - **Replace** overwrites the original after an inline confirmation. It keeps
@@ -106,7 +115,7 @@ else in, phone home, or take the desktop down with it:
 - File headers are read off the ring's UI thread, with a bounded walk, so a
   crafted file can't freeze the ring while it holds the keyboard.
 
-Inputs are never modified, except by the crop tool's Replace. Outputs are
+Inputs are never modified, except by the edit window's Replace. Outputs are
 numbered rather than overwriting anything, and a failed conversion leaves
 nothing behind.
 
@@ -122,7 +131,7 @@ sudo dnf install python3-gobject python3-cairo gtk4 gtk4-layer-shell ImageMagick
 
 The `ffmpeg` package must be the full build (RPM Fusion, with libx264, libvpx,
 libopus and libmp3lame). A FileChooser portal backend such as
-`xdg-desktop-portal-gnome` or `-gtk` is needed for the crop tool's Save. Reading
+`xdg-desktop-portal-gnome` or `-gtk` is needed for the edit window's Save. Reading
 the Forward button (or your binding) needs read access to `/dev/input` (for
 example the `input` group); without it only Ctrl+Alt+C works. The daemon asks
 the kernel for the binding's keys only, so typing and mouse movement never

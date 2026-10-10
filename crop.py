@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-"""Prism's crop tool: one image, a crop box, and Replace / Save / Copy.
+"""Prism's edit window: one image, cropped or rotated, then Replace / Save / Copy.
 
-    crop.py IMAGE
+    crop.py [--crop | --rotate] IMAGE
 
 An ordinary window (Hyprland tiles it; no title bar, Esc closes), run by the
 ring daemon as its own process, so a huge image or a crash here can't take the
-ring down. The pixel work is convert.crop(); this file only collects the box."""
+ring down. The pixel work is convert.crop(); this file only collects the box
+(crop) or the orientation (rotate: quarter turns and flips)."""
 import math
 import os
 import subprocess
@@ -200,11 +201,7 @@ def checker():
 
 def draw(cr, width, height, box, preview, dragging=False, fade=1.0):
     """The image, everything outside the box dimmed, and the box with its handles."""
-    glow = cairo.RadialGradient(width / 2, height * 0.45, 0, width / 2, height * 0.45, max(width, height) * 0.7)
-    glow.add_color_stop_rgb(0, 0.13, 0.12, 0.112)
-    glow.add_color_stop_rgb(1, *BACKDROP)
-    cr.set_source(glow)
-    cr.paint()
+    backdrop(cr, width, height)
     box.layout(width, height)
     ix, iy, iw, ih = box.ox, box.oy, box.w * box.s, box.h * box.s
     for k in range(1, 7):  # soft shadow under the image
@@ -284,6 +281,90 @@ def draw(cr, width, height, box, preview, dragging=False, fade=1.0):
         cr.show_text(text)
 
 
+# Orientations as 2x2 matrices from image to screen (y down): what rotate shows.
+IDENTITY = ((1, 0), (0, 1))
+TURN_RIGHT = ((0, -1), (1, 0))  # clockwise on screen
+TURN_LEFT = ((0, 1), (-1, 0))
+FLIP_H = ((-1, 0), (0, 1))  # mirror left-right
+FLIP_V = ((1, 0), (0, -1))  # mirror top-bottom
+
+
+def mul(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(2)) for j in range(2)) for i in range(2))
+
+
+def turns_mirror(m):
+    """m as convert.crop's (turns, mirror): mirror left-right first, then turn clockwise."""
+    mirror = m[0][0] * m[1][1] - m[0][1] * m[1][0] < 0
+    unmirrored = mul(m, FLIP_H) if mirror else m
+    r = IDENTITY
+    for turns in range(4):
+        if r == unmirrored:
+            return turns, mirror
+        r = mul(TURN_RIGHT, r)
+    raise ValueError(m)
+
+
+def draw_rotate(cr, width, height, size, preview, m, motion=None, fade=1.0):
+    """The whole image in orientation m, fitted to the window; motion = (step, t) glides
+    from m to step * m: a quarter turn swings round, a flip folds over its axis."""
+    backdrop(cr, width, height)
+    left, top, right, bottom = INSETS
+    aw, ah = max(1, width - left - right), max(1, height - top - bottom)
+    w, h = size
+    anim = ((1, 0), (0, 1))
+    fit = m
+    if motion:
+        step, t = motion
+        e = ease(t)
+        if step in (TURN_RIGHT, TURN_LEFT):
+            a = (math.pi / 2 if step == TURN_RIGHT else -math.pi / 2) * e
+            anim = ((math.cos(a), -math.sin(a)), (math.sin(a), math.cos(a)))
+            fit = anim  # applied to m below; sizes the swing so it never clips
+        else:  # a fold: squash through zero along the flip's axis
+            k = 1 - 2 * e
+            k = math.copysign(max(abs(k), 0.002), k)  # edge-on is a singular matrix: cairo refuses it
+            anim = ((k, 0), (0, 1)) if step == FLIP_H else ((1, 0), (0, k))
+            fit = ((1, 0), (0, 1))
+        fit = tuple(tuple(sum(fit[i][k] * m[k][j] for k in range(2)) for j in range(2)) for i in range(2))
+    bw = abs(fit[0][0]) * w + abs(fit[0][1]) * h
+    bh = abs(fit[1][0]) * w + abs(fit[1][1]) * h
+    s = min(aw / bw, ah / bh)
+    full = tuple(tuple(sum(anim[i][k] * m[k][j] for k in range(2)) for j in range(2)) for i in range(2))
+    cx, cy = left + aw / 2, top + ah / 2
+    cr.save()
+    cr.translate(cx, cy)
+    cr.transform(cairo.Matrix(full[0][0], full[1][0], full[0][1], full[1][1], 0, 0))
+    cr.scale(s, s)
+    for k in range(1, 7):  # soft shadow under the image
+        rounded(cr, -w / 2 - k * 2 / s, -h / 2 - k * 2 / s, w + k * 4 / s, h + k * 4 / s, (6 + k * 2) / s)
+        cr.set_source_rgba(0, 0, 0, 0.06 * fade)
+        cr.fill()
+    if preview.get_format() == cairo.FORMAT_ARGB32:
+        cr.rectangle(-w / 2, -h / 2, w, h)
+        cr.save()
+        cr.identity_matrix()
+        cr.set_source(checker())
+        cr.restore()
+        cr.fill()
+    cr.translate(-w / 2, -h / 2)
+    cr.scale(w / preview.get_width(), h / preview.get_height())
+    cr.set_source_surface(preview, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_GOOD)
+    cr.rectangle(0, 0, preview.get_width(), preview.get_height())
+    cr.clip()
+    cr.paint_with_alpha(fade)
+    cr.restore()
+
+
+def backdrop(cr, width, height):
+    glow = cairo.RadialGradient(width / 2, height * 0.45, 0, width / 2, height * 0.45, max(width, height) * 0.7)
+    glow.add_color_stop_rgb(0, 0.13, 0.12, 0.112)
+    glow.add_color_stop_rgb(1, *BACKDROP)
+    cr.set_source(glow)
+    cr.paint()
+
+
 def notify(title, body=""):
     try:
         subprocess.Popen(["notify-send", "-a", "Prism", "-i", "document-save", title, body],
@@ -296,12 +377,13 @@ CURSORS = {"n": "n-resize", "s": "s-resize", "e": "e-resize", "w": "w-resize", "
            "nw": "nw-resize", "se": "se-resize", "sw": "sw-resize", "move": "move", "new": "crosshair"}
 
 
-def button(text, icon, handler, primary=False):
-    b = Gtk.Button()
+def button(text, icon, handler, primary=False, tip=None):
+    b = Gtk.Button(tooltip_text=tip)
     row = Gtk.Box(spacing=7)
     if icon:
         row.append(Gtk.Image.new_from_icon_name(icon))
-    row.append(Gtk.Label(label=text))
+    if text:
+        row.append(Gtk.Label(label=text))
     b.set_child(row)
     if primary:
         b.add_css_class("primary")
@@ -310,9 +392,12 @@ def button(text, icon, handler, primary=False):
 
 
 class CropWindow(Gtk.ApplicationWindow):
-    def __init__(self, app, path):
-        super().__init__(application=app, title=f"Crop — {os.path.basename(path)}")
+    def __init__(self, app, path, tool="crop"):
+        super().__init__(application=app, title=f"{tool.title()} — {os.path.basename(path)}")
         self.path = Path(path).absolute()
+        self.tool = tool
+        self.m = IDENTITY  # rotate: the orientation shown and saved
+        self.motion = None  # rotate: (step, start time) of the turn or flip gliding in
         self.box = self.preview = None
         self.mode, self.start_box, self.start_pt = None, None, None
         self.busy = False
@@ -365,6 +450,16 @@ class CropWindow(Gtk.ApplicationWindow):
         self.save_btn = button("Save", "document-save-symbolic", self.on_save)
         self.replace_btn = button("Replace", "view-refresh-symbolic", self.on_replace, primary=True)
         main = Gtk.Box(spacing=2)
+        self.orient_btns = []
+        if tool == "rotate":
+            for icon, step, tip in (("object-rotate-left-symbolic", TURN_LEFT, "Rotate left  ["),
+                                    ("object-rotate-right-symbolic", TURN_RIGHT, "Rotate right  ]"),
+                                    ("object-flip-horizontal-symbolic", FLIP_H, "Flip horizontally  H"),
+                                    ("object-flip-vertical-symbolic", FLIP_V, "Flip vertically  V")):
+                b = button(None, icon, lambda _b, step=step: self.orient(step), tip=tip)
+                self.orient_btns.append(b)
+                main.append(b)
+            main.append(self.separator())
         for w in (self.size_label, self.separator(), self.copy_btn, self.save_btn, self.replace_btn):
             main.append(w)
         confirm = Gtk.Box(spacing=2)
@@ -438,17 +533,44 @@ class CropWindow(Gtk.ApplicationWindow):
     def set_ready(self, ready):
         ready = ready and self.box is not None and not self.busy
         self.copy_btn.set_sensitive(ready)
-        # Replacing or saving the whole image unchanged would be pointless.
+        for b in self.orient_btns:
+            b.set_sensitive(ready)
+        # Replacing or saving the image unchanged would be pointless.
+        unchanged = self.box is not None and self.box.whole() and self.m == IDENTITY
         for b in (self.save_btn, self.replace_btn):
-            b.set_sensitive(ready and not self.box.whole())
+            b.set_sensitive(ready and not unchanged)
         if self.box:
-            x, y, w, h = self.box.rect()
+            w, h = self.result_size(self.box.rect())
             self.size_label.set_text(f"{w} × {h}")
+
+    def result_size(self, rect, m=None):
+        """What the edit writes: the box, turned on its side by an odd number of quarter turns."""
+        turns, _ = turns_mirror(self.m if m is None else m)
+        return (rect[3], rect[2]) if turns % 2 else (rect[2], rect[3])
+
+    def orient(self, step):
+        """Rotate: one quarter turn or flip, gliding in."""
+        if not self.box or self.busy:
+            return
+        self.bar.set_visible_child_name("main")  # a Replace question was about the old orientation
+        self.m = mul(step, self.m)
+        self.motion = (step, time.monotonic())
+        self.set_ready(True)
+        self.animate()
 
     # Drawing, animation and dragging
 
     def on_draw(self, _area, cr, width, height):
-        if self.box:
+        if self.box and self.tool == "rotate":
+            motion = None
+            if self.motion:
+                step, t0 = self.motion
+                before = mul(((step[0][0], step[1][0]), (step[0][1], step[1][1])), self.m)  # step is orthogonal
+                motion = (step, (time.monotonic() - t0) / EASE)
+                draw_rotate(cr, width, height, (self.box.w, self.box.h), self.preview, before, motion, self.fade)
+            else:
+                draw_rotate(cr, width, height, (self.box.w, self.box.h), self.preview, self.m, fade=self.fade)
+        elif self.box:
             draw(cr, width, height, self.box, self.preview, dragging=self.mode is not None, fade=self.fade)
         else:
             cr.set_source_rgb(*BACKDROP)
@@ -477,14 +599,16 @@ class CropWindow(Gtk.ApplicationWindow):
             if t >= 1:
                 self.glide = None
                 self.set_ready(True)
+        if self.motion and now - self.motion[1] >= EASE:
+            self.motion = None
         self.area.queue_draw()
-        if self.fade >= 1 and not self.glide and not self.zoom_goal:
+        if self.fade >= 1 and not self.glide and not self.zoom_goal and not self.motion:
             self.tick_id = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
     def on_scroll(self, controller, dx, dy):
-        if not self.box:
+        if not self.box or self.tool != "crop":
             return False
         wheel = controller.get_unit() == Gdk.ScrollUnit.WHEEL
         if controller.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
@@ -498,7 +622,7 @@ class CropWindow(Gtk.ApplicationWindow):
         return True
 
     def on_pan(self, _g, dx, dy):
-        if self.box:
+        if self.box and self.tool == "crop":
             self.box.pan(dx - self.pan_from[0], dy - self.pan_from[1])
             self.pan_from = (dx, dy)
             self.zoomed()
@@ -508,7 +632,7 @@ class CropWindow(Gtk.ApplicationWindow):
 
     def zoom_by(self, factor):
         """Ctrl + / Ctrl - / Ctrl 0: glide the zoom, around the pointer if it's over the image."""
-        if not self.box:
+        if not self.box or self.tool != "crop":
             return
         current = self.zoom_goal[0] if self.zoom_goal else self.box.zoom
         goal = 1.0 if factor is None else max(1.0, min(self.box.max_zoom(), current * factor))
@@ -525,11 +649,11 @@ class CropWindow(Gtk.ApplicationWindow):
 
     def on_motion(self, _c, x, y):
         self.pointer = (x, y)
-        if self.box and self.mode is None:
+        if self.box and self.mode is None and self.tool == "crop":
             self.area.set_cursor_from_name(CURSORS[self.box.grab(x, y)])
 
     def on_drag_begin(self, _g, x, y):
-        if not self.box or self.busy:
+        if not self.box or self.busy or self.tool != "crop":
             return
         self.glide = None
         self.mode = self.box.grab(x, y)
@@ -577,16 +701,28 @@ class CropWindow(Gtk.ApplicationWindow):
             if self.copy_btn.get_sensitive():
                 self.on_copy()
             return True
+        steps = {Gdk.KEY_bracketleft: TURN_LEFT, Gdk.KEY_bracketright: TURN_RIGHT,
+                 Gdk.KEY_h: FLIP_H, Gdk.KEY_H: FLIP_H, Gdk.KEY_v: FLIP_V, Gdk.KEY_V: FLIP_V}
+        if self.tool == "rotate" and keyval in steps and not state & Gdk.ModifierType.CONTROL_MASK:
+            self.orient(steps[keyval])
+            return True
         return False
 
     # Replace / Save / Copy
 
     def run(self, label, job, done):
-        """Run job() off the GTK thread; then done(result) on it, or show the error."""
+        """Run job() off the GTK thread; then done(result) on it, or show the error.
+        One at a time: the portal's Save dialog doesn't block the window, so a Copy
+        can still be running when a destination comes back."""
+        if self.busy:
+            self.say("Still working on the last one; try again in a moment", True)
+            return
         self.busy = True
         self.set_ready(False)
         self.say(label, stay=True)
         rect = self.box.rect()
+        m = self.m
+        self.edit = turns_mirror(m)  # what this job writes, whatever is clicked meanwhile
 
         def work():
             try:
@@ -594,7 +730,7 @@ class CropWindow(Gtk.ApplicationWindow):
             except Exception as e:
                 GLib.idle_add(self.finished, None, str(e))
             else:
-                GLib.idle_add(self.finished, lambda: done(result, rect), None)
+                GLib.idle_add(self.finished, lambda: done(result, self.result_size(rect, m)), None)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -610,7 +746,7 @@ class CropWindow(Gtk.ApplicationWindow):
     def on_copy(self, *_):
         def job(rect):
             with tempfile.TemporaryDirectory(prefix="prism-crop-") as tmp:
-                png = convert.crop(self.path, rect, Path(tmp) / "crop.png")
+                png = self.write(rect, Path(tmp) / "edit.png")
                 env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
                 with open(png, "rb") as data:
                     # wl-copy forks and keeps serving the image after this window closes.
@@ -620,11 +756,17 @@ class CropWindow(Gtk.ApplicationWindow):
             if code:
                 raise RuntimeError("wl-copy could not reach the clipboard")
 
-        self.run("Copying…", job, lambda _r, rect: self.say(f"Copied {rect[2]} × {rect[3]} to the clipboard"))
+        self.run("Copying…", job, lambda _r, size: self.say(f"Copied {size[0]} × {size[1]} to the clipboard"))
+
+    def write(self, rect, dest):
+        return convert.crop(self.path, rect, dest, *self.edit)
+
+    def done_word(self):
+        return "cropped" if self.tool == "crop" else "rotated"
 
     def on_save(self, *_):
-        dialog = Gtk.FileDialog(title="Save cropped image", modal=True,
-                                initial_name=f"{self.path.stem} (cropped){self.path.suffix}",
+        dialog = Gtk.FileDialog(title=f"Save {self.done_word()} image", modal=True,
+                                initial_name=f"{self.path.stem} ({self.done_word()}){self.path.suffix}",
                                 initial_folder=Gio.File.new_for_path(str(self.path.parent)))
         dialog.save(self, None, self.on_save_chosen)
 
@@ -637,8 +779,8 @@ class CropWindow(Gtk.ApplicationWindow):
         if not dest:
             self.say("Choose a folder on this computer", True)
             return
-        self.run("Saving…", lambda rect: convert.crop(self.path, rect, dest),
-                 lambda saved, rect: self.done(f"Saved cropped image ({rect[2]} × {rect[3]})",
+        self.run("Saving…", lambda rect: self.write(rect, dest),
+                 lambda saved, size: self.done(f"Saved {self.done_word()} image ({size[0]} × {size[1]})",
                                                os.path.basename(saved)))
 
     def on_replace(self, *_):
@@ -651,11 +793,11 @@ class CropWindow(Gtk.ApplicationWindow):
             now = self.path.stat()
             if (now.st_mtime_ns, now.st_size, now.st_ino) != (self.stamp.st_mtime_ns, self.stamp.st_size,
                                                              self.stamp.st_ino):
-                raise RuntimeError("The file changed since it was opened; reopen it to crop")
-            return convert.crop(self.path, rect, self.path)
+                raise RuntimeError(f"The file changed since it was opened; reopen it to {self.tool}")
+            return self.write(rect, self.path)
 
-        self.run("Replacing…", job, lambda _r, rect: self.done(
-            f"Cropped {self.path.name} ({rect[2]} × {rect[3]})", "The original was replaced."))
+        self.run("Replacing…", job, lambda _r, size: self.done(
+            f"{self.done_word().capitalize()} {self.path.name} ({size[0]} × {size[1]})", "The original was replaced."))
 
     def done(self, title, body):
         notify(title, body)
@@ -669,17 +811,19 @@ class CropWindow(Gtk.ApplicationWindow):
 
 
 def main():
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    tool = args.pop(0)[2:] if args and args[0] in ("--crop", "--rotate") else "crop"
+    if len(args) != 1:
         sys.exit(__doc__)
     if not Gtk.init_check() or Gdk.Display.get_default() is None:
-        notify("Can't open the crop tool", "No Wayland display.")
+        notify(f"Can't open the {tool} tool", "No Wayland display.")
         sys.exit(1)
     css = Gtk.CssProvider()
     css.load_from_data(CSS)
     Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                               Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     app = Gtk.Application(application_id="dev.prism.Crop", flags=Gio.ApplicationFlags.NON_UNIQUE)
-    app.connect("activate", lambda a: CropWindow(a, sys.argv[1]).present())
+    app.connect("activate", lambda a: CropWindow(a, args[0], tool).present())
     sys.exit(app.run([sys.argv[0]]))
 
 

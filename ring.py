@@ -486,10 +486,10 @@ class Ring(Gtk.ApplicationWindow):
                 notify("Can't convert that selection" if files else "Nothing to convert",
                        "Mixed or unsupported file types." if files else "Select one or more files first.")
             return
-        # Formats, sizes and compression levels each live in their own ring,
-        # behind one petal: CONVERT, COMPRESS, RESCALE; then the direct actions
-        # CROP (opens the crop window) and CLEAN.
-        actions = [t for t in ("crop", "clean") if t in targets]
+        # Formats, compression levels, sizes and edits each live in their own
+        # ring, behind one petal: CONVERT, COMPRESS, RESCALE, EDIT (CROP and
+        # ROTATE, which open the edit window); then the direct action CLEAN.
+        actions = [t for t in ("clean",) if t in targets]
         groups = {"convert": [t for t in targets if t not in actions
                               and not any(t in group for group in convert.SUBMENUS.values())],
                   **{name: [t for t in targets if t in group] for name, group in convert.SUBMENUS.items()}}
@@ -543,8 +543,8 @@ class Ring(Gtk.ApplicationWindow):
             # Start converting now, while the drop animation plays.
             if DRY:
                 pass
-            elif self.result == "crop":
-                open_crop(self.files[0])
+            elif self.result in ("crop", "rotate"):
+                open_edit(self.files[0], self.result)
             else:
                 self.get_application().start(self.files, self.result)
         else:
@@ -1022,14 +1022,14 @@ def notify(title, body=""):
         debug(f"notify failed: {title}: {body}")
 
 
-def open_crop(path):
-    """The crop tool is its own process and an ordinary (tiled) window."""
+def open_edit(path, tool):
+    """The edit window (crop or rotate) is its own process and an ordinary (tiled) window."""
     env = [f"{k}={v}" for k, v in os.environ.items() if k != "LD_PRELOAD"]
     try:
         GLib.spawn_async(["/usr/bin/python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "crop.py"),
-                          path], envp=env, flags=GLib.SpawnFlags.STDOUT_TO_DEV_NULL)
+                          f"--{tool}", path], envp=env, flags=GLib.SpawnFlags.STDOUT_TO_DEV_NULL)
     except GLib.Error as e:
-        notify("Can't open the crop tool", e.message)
+        notify(f"Can't open the {tool} tool", e.message)
 
 
 def report(jobs, ext):
