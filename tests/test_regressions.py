@@ -669,6 +669,68 @@ class CleanTests(unittest.TestCase):
         scrub.scrub_tree(media, lambda p: None)
 
 
+class HostileInputTests(unittest.TestCase):
+    """Files to convert come from anywhere: they must not read other files or URLs."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="prism-hostile-")
+        root = Path(self.tmp.name)
+        self.outside = root / "private"; self.outside.mkdir()
+        self.folder = root / "downloads"; self.folder.mkdir()
+        subprocess.run(["magick", "-size", "13x7", "xc:#123456", "-comment", "SECRETPIXELS",
+                        str(self.outside / "secret.png")], check=True)
+        self.secret = (self.outside / "secret.png").read_bytes()
+        subprocess.run(["magick", "-size", "8x8", "xc:#ff8800", str(self.folder / "ok.png")], check=True)
+        (self.folder / "link.png").symlink_to(self.outside / "secret.png")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def leaked(self, out):
+        """The secret (13x7 px) in the output: embedded as data: or copied as a file."""
+        import base64
+        data = Path(out).read_bytes()
+        thirteen_by_seven = b"IHDR\x00\x00\x00\x0d\x00\x00\x00\x07"
+        return any(x in data for x in (base64.b64encode(self.secret), base64.b64encode(thirteen_by_seven)[:16],
+                                       thirteen_by_seven, b"SECRETPIXELS"))
+
+    def test_markdown_cannot_embed_files_outside_its_folder(self):
+        src = self.folder / "doc.md"
+        src.write_text(f"# Hi\n\n![abs]({self.outside}/secret.png)\n\n![up](../private/secret.png)\n\n"
+                       "![sym](link.png)\n\n"
+                       f'<img src="{self.outside}/secret.png">\n\n'
+                       f'<div style="background:url({self.outside}/secret.png)">styled</div>\n\n'
+                       "![fine](ok.png)\n")
+        out = convert.convert(str(src), "html")
+        html_out = Path(out).read_text()
+        self.assertFalse(self.leaked(out))
+        self.assertIn("data:image/png;base64", html_out)  # ok.png, inside the folder, still embedded
+        self.assertIn("abs", html_out)  # dropped images keep their alt text
+
+    def test_html_cannot_embed_files_outside_its_folder(self):
+        src = self.folder / "page.html"
+        src.write_text(f'<html><body><p>Hello</p><img src="{self.outside}/secret.png" alt="a">'
+                       '<img src="../private/secret.png" alt="b"><img src="link.png" alt="c">'
+                       f'<p style="background:url(file://{self.outside}/secret.png)">x</p>'
+                       '<img src="ok.png" alt="fine"></body></html>')
+        for ext in ("md",):
+            out = Path(convert.convert(str(src), ext))
+            files = [out] if out.is_file() else [p for p in out.rglob("*") if p.is_file()]
+            self.assertFalse(any(self.leaked(f) for f in files), ext)
+
+    def test_markdown_does_not_fetch_urls(self):
+        src = self.folder / "web.md"
+        src.write_text("![web](http://127.0.0.1:9/x.png) and text\n")
+        html_out = Path(convert.convert(str(src), "html")).read_text()  # no fetch, so no failure
+        self.assertNotIn("127.0.0.1", html_out)
+        self.assertIn("and text", html_out)
+
+    def test_renamed_postscript_is_not_run(self):
+        src = self.folder / "photo.png"
+        src.write_text("%!PS\n/Helvetica findfont 20 scalefont setfont 10 10 moveto (hi) show showpage\n")
+        with self.assertRaises(RuntimeError):
+            convert.convert(str(src), "jpg")
+
+
 class InstallerTests(unittest.TestCase):
     def test_installer_uses_xdg_data_directory(self):
         with tempfile.TemporaryDirectory() as d:

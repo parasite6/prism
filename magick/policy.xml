@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Prism's ImageMagick policy, loaded through MAGICK_CONFIGURE_PATH for every
+     magick call (convert._run). Files to convert come from anywhere, and
+     ImageMagick picks the decoder from the content, not the extension: a
+     ".png" holding MVG, MSL, PostScript or a URL could read local files, fetch
+     URLs or run Ghostscript. So every coder and delegate is denied, then only
+     the formats Prism handles are allowed back. -->
+<policymap>
+  <policy domain="delegate" rights="none" pattern="*"/>
+  <policy domain="coder" rights="none" pattern="*"/>
+  <policy domain="coder" rights="read|write"
+          pattern="{PNG,PNG8,PNG24,PNG32,PNG48,PNG64,APNG,JPEG,JPG,JPE,PJPEG,WEBP,GIF,GIF87,BMP,BMP2,BMP3,TIFF,TIF,TIFF64,PTIF,ICO,ICON,SVG,SVGZ,RSVG,ICC,ICM}"/>
+  <!-- Internal: intermediate files and the pixel cache's spill-over. -->
+  <policy domain="coder" rights="read|write" pattern="{MPC,CACHE,MIFF}"/>
+  <!-- No reading arguments or file lists from a file (@list.txt). -->
+  <policy domain="path" rights="none" pattern="@*"/>
+</policymap>

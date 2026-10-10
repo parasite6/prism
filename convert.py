@@ -12,6 +12,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+from urllib.parse import unquote, urlsplit
 from gif_convert import convert_gif
 import scrub
 from sizes import is_animated_avif, is_apng, size_of
@@ -237,8 +238,8 @@ def output_path(src, ext):
     return str(next(p for p in _names(src.parent, src.stem, f".{ext}") if not os.path.lexists(p)))
 
 
-def _run(cmd, *, cwd=None, timeout=120, isolated_python=False):
-    env = os.environ.copy()
+def _run(cmd, *, cwd=None, timeout=120, isolated_python=False, extra_env=None):
+    env = {**os.environ, **(extra_env or {})}
     # The launcher preloads layer-shell for GTK, not conversion subprocesses.
     env.pop("LD_PRELOAD", None)
     if cmd[0] == "magick":
@@ -248,6 +249,9 @@ def _run(cmd, *, cwd=None, timeout=120, isolated_python=False):
             cmd = [*cmd[:at], *_MAGICK_LIMITS, *cmd[at:]]
         if getattr(_job, "work", None):
             env["MAGICK_TEMPORARY_PATH"] = str(_job.work)
+        # Only the formats Prism handles: no sniffing a renamed file into
+        # PostScript/MSL/URL coders or delegates (magick/policy.xml).
+        env["MAGICK_CONFIGURE_PATH"] = str(BASE / "magick")
     if isolated_python:
         env.pop("PYTHONHOME", None)
         env.pop("PYTHONPATH", None)
@@ -337,16 +341,45 @@ def _publish(payload, src, ext, *, bundle=False, folder=None, stem=None, suffix=
         return dest
 
 
+def _local_images(src, resource_dir):
+    """The image paths in a document that are files inside its own folder
+    (symlinks resolved). Only these, the document's own media and data: URIs
+    may be embedded: a downloaded document must not pull ~/.ssh/id_rsa, ../..,
+    or a URL into its output (safe-resources.lua drops everything else)."""
+    tree = json.loads(_run(["pandoc", str(src), "-t", "json"]))
+    targets = set()
+    stack = [tree.get("blocks", [])]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if node.get("t") == "Image":
+                targets.add(node["c"][2][0])
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    root = os.path.realpath(resource_dir)
+    safe = []
+    for target in targets:
+        parts = urlsplit(target)
+        if parts.scheme or parts.netloc or not parts.path or target.startswith(("/", "~", "\\")) or "\n" in target:
+            continue
+        path = os.path.realpath(os.path.join(root, unquote(parts.path)))
+        if path.startswith(root + os.sep) and os.path.isfile(path):
+            safe.append(target)
+    return safe
+
+
 def _pandoc(src, ext, out, *, cwd, resource_dir):
     target = {"md": "gfm", "txt": "plain"}.get(ext, ext)
     cmd = ["pandoc", str(src), "-s", "-t", target, "-o", str(out),
            f"--resource-path={os.path.relpath(resource_dir, cwd)}",  # ':' in a path would split it
+           f"--lua-filter={BASE / 'safe-resources.lua'}",
            f"--lua-filter={BASE / 'strip-meta.lua'}", f"--variable=pagetitle:{Path(out).stem}"]
     if ext == "html":
         cmd.append("--embed-resources")
     elif ext == "md":
         cmd.append("--extract-media=media")
-    _run(cmd, cwd=cwd)
+    _run(cmd, cwd=cwd, extra_env={"PRISM_IMAGES": "\n".join(_local_images(src, resource_dir))})
 
 
 def _pages_to_images(src, kind, ext, payload, work):
@@ -909,6 +942,8 @@ def convert(src, ext):
             # names the result after src anyway.
             out = payload / f"converted.{ext}"
             image = src  # what the encoders read; output is still named after src
+            if ext_of(src) == "svg":
+                image = f"rsvg:{src}"  # the built-in librsvg; never an external delegate (Inkscape)
             frames = ["-coalesce"] if ext_of(src) in {"gif", "webp"} else []
             if ext_of(src) == "avif" and is_animated_avif(src):
                 warnings.append("Animated AVIF: kept the first frame")
