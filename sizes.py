@@ -70,7 +70,9 @@ def _webp(h):
 
 def _bmp(h):
     if h[:2] == b"BM":
-        width, height = struct.unpack("<ii", h[18:26])
+        if struct.unpack("<I", h[14:18])[0] == 12:  # OS/2 BITMAPCOREHEADER: 16-bit unsigned
+            return struct.unpack("<HH", h[18:22])
+        width, height = struct.unpack("<ii", h[18:26])  # negative height means top-down
         return abs(width), abs(height)
 
 
@@ -115,10 +117,21 @@ def _avi(h):
             return struct.unpack("<II", h[i + 40:i + 48])  # dwWidth, dwHeight
 
 
-def _boxes(f, start, stop):
-    """(type, payload start, payload end) for each ISO-BMFF box in [start, stop)."""
+# Most elements/boxes one header walk may visit. Real files have a few dozen
+# before the size (MP4's top level is a handful of large boxes even with moov
+# at the end); a crafted file of millions of tiny ones would otherwise keep the
+# UI thread busy for seconds per MB.
+_WALK = 10000
+
+
+def _boxes(f, start, stop, budget):
+    """(type, payload start, payload end) for each ISO-BMFF box in [start, stop).
+    budget is a one-item list shared by the whole walk, so nesting can't multiply it."""
     pos = start
     while pos + 8 <= stop:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise ValueError("too many boxes")
         f.seek(pos)
         head = f.read(8)
         if len(head) < 8:
@@ -142,14 +155,14 @@ def _mp4(f):
     if f.read(4) not in (b"ftyp", b"moov", b"wide", b"free", b"mdat", b"skip"):
         return None
     end = f.seek(0, 2)
-    best = None
-    for kind, start, stop in _boxes(f, 0, end):
+    best, budget = None, [_WALK]
+    for kind, start, stop in _boxes(f, 0, end, budget):
         if kind != b"moov":
             continue
-        for kind, start, stop in _boxes(f, start, stop):
+        for kind, start, stop in _boxes(f, start, stop, budget):
             if kind != b"trak":
                 continue
-            for kind, start, stop in _boxes(f, start, stop):
+            for kind, start, stop in _boxes(f, start, stop, budget):
                 if kind != b"tkhd":
                     continue
                 f.seek(start)
@@ -186,9 +199,14 @@ def _matroska(f):
     f.seek(0)
     end = f.seek(0, 2)
     f.seek(0)
+    budget = _WALK
 
     def children(stop):
+        nonlocal budget
         while f.tell() < stop:
+            budget -= 1
+            if budget < 0:
+                raise ValueError("too many elements")
             ident = _vint(f, True)
             size = _vint(f, False)
             start = f.tell()

@@ -3,6 +3,7 @@ import html
 import contextlib
 import ctypes
 import errno
+import fcntl
 import functools
 import json
 import os
@@ -238,10 +239,60 @@ def output_path(src, ext):
     return str(next(p for p in _names(src.parent, src.stem, f".{ext}") if not os.path.lexists(p)))
 
 
+# Tools whose input formats can reference other files or URLs (LibreOffice's
+# linked images, ffmpeg's DASH/concat manifests) run in a bubblewrap sandbox:
+# no network, no home folder, and of the user's files only the one being
+# converted (read-only) and the job's own temp folder (writable) exist.
+SANDBOXED = {"soffice", "ffmpeg", "ffprobe"}
+
+
+def _sandbox(cmd, cwd):
+    """bwrap argv that runs cmd with only its input files and the job folder visible."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError("Prism needs bubblewrap to convert files safely: sudo dnf install bubblewrap")
+    job = getattr(_job, "work", None)
+    writable = [str(job.parent)] if job else []
+    # Outputs (absolute paths that don't exist yet) go to folders Prism made;
+    # also covers threads without _job (gif_convert's parallel chunk encodes).
+    outputs = [os.path.dirname(a) for a in map(str, cmd) if a.startswith("/") and not os.path.lexists(a)]
+    for folder in [*outputs, *([str(cwd)] if cwd else [])]:
+        if os.path.isdir(folder) and not any(folder == w or folder.startswith(w + os.sep) for w in writable):
+            writable.append(folder)
+    # Absolute paths in the command that already exist outside the writable
+    # folders are its inputs: each is bound alone, read-only, never its folder.
+    inputs = [a for a in map(str, cmd) if a.startswith("/") and os.path.isfile(a)
+              and not a.startswith(("/usr/", "/etc/"))  # already visible, read-only
+              and not any(a.startswith(w + os.sep) for w in writable)]
+    args = [bwrap, "--unshare-all", "--die-with-parent", "--new-session",
+            "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc",
+            "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
+            "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev", "--ro-bind-try", "/sys", "/sys",
+            "--tmpfs", "/tmp", "--dir", "/tmp/home",
+            "--setenv", "HOME", "/tmp/home", "--setenv", "TMPDIR", "/tmp", "--unsetenv", "XDG_RUNTIME_DIR",
+            "--unsetenv", "DBUS_SESSION_BUS_ADDRESS", "--unsetenv", "WAYLAND_DISPLAY", "--unsetenv", "DISPLAY"]
+    # The GPU (NVENC/CUDA) and render nodes, but no other devices (no /dev/input).
+    for dev in ["/dev/dri", *(f"/dev/{d}" for d in os.listdir("/dev") if d.startswith("nvidia"))]:
+        args += ["--dev-bind-try", dev, dev]
+    # Fonts for LibreOffice, and their cache so it isn't rebuilt every time.
+    home = Path.home()
+    for fonts in (home / ".local/share/fonts", home / ".fonts", home / ".cache/fontconfig"):
+        args += ["--ro-bind-try", str(fonts), str(fonts)]
+    for path in inputs:
+        args += ["--ro-bind", path, path]
+    for path in writable:
+        args += ["--bind", path, path]
+    if cwd:
+        args += ["--chdir", str(cwd)]
+    return [*args, "--", *cmd]
+
+
 def _run(cmd, *, cwd=None, timeout=120, isolated_python=False, extra_env=None):
     env = {**os.environ, **(extra_env or {})}
     # The launcher preloads layer-shell for GTK, not conversion subprocesses.
     env.pop("LD_PRELOAD", None)
+    tool = Path(cmd[0]).name
     if cmd[0] == "magick":
         if "-limit" not in cmd:  # after a subcommand ("magick identify ..."), if any
             at = 2 if len(cmd) > 1 and cmd[1] in ("identify", "mogrify", "compare", "composite",
@@ -255,6 +306,8 @@ def _run(cmd, *, cwd=None, timeout=120, isolated_python=False, extra_env=None):
     if isolated_python:
         env.pop("PYTHONHOME", None)
         env.pop("PYTHONPATH", None)
+    if tool in SANDBOXED:
+        cmd = _sandbox(cmd, cwd)
     try:
         # Background priority, so encodes don't make the desktop lag. Via `nice`,
         # not preexec_fn, which isn't safe in this multi-threaded process.
@@ -271,21 +324,23 @@ def _run(cmd, *, cwd=None, timeout=120, isolated_python=False, extra_env=None):
         except ProcessLookupError:
             pass
         proc.communicate()
-        raise RuntimeError(f"{Path(cmd[0]).name} timed out after {timeout:g} seconds") from None
+        raise RuntimeError(f"{tool} timed out after {timeout:g} seconds") from None
     if proc.returncode == 127 and not stdout:
-        raise RuntimeError(f"Required tool is not installed: {cmd[0]}")
+        raise RuntimeError(f"Required tool is not installed: {tool}")
     if proc.returncode:
         message = (stderr or stdout).strip()
         if "cache resources exhausted" in message:
             raise RuntimeError("Too large to process without hogging memory; output was not saved")
         raise RuntimeError(message.splitlines()[-1] if message else f"{cmd[0]} failed")
-    if Path(cmd[0]).name == "pandoc" and "Could not fetch resource" in stderr:
+    if tool == "pandoc" and "Could not fetch resource" in stderr:
         raise RuntimeError("A document image or linked resource could not be read; output was not saved")
     return stdout
 
 
 def _soffice(src, ext, out, filter=None):
-    with tempfile.TemporaryDirectory(prefix="prism-office-") as tmp:
+    # Inside the job's folder: the one place the sandboxed soffice may write.
+    job = getattr(_job, "work", None)
+    with tempfile.TemporaryDirectory(prefix="office-", dir=job) as tmp:
         folder = Path(tmp)
         profile = (folder / "profile").as_uri()
         exported = folder / "export"
@@ -873,41 +928,65 @@ _registry_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def _registered(tmp):
-    """Record in-progress temp folders, so a daemon that was killed mid-conversion
-    can remove the half-written folders it left next to the user's files."""
-    with _registry_lock:
+def _registry():
+    """The job list, locked across processes: the daemon, conversion workers
+    and crop windows all update it. Lines are "pid<TAB>temp folder"."""
+    with _registry_lock, open(REGISTRY.with_suffix(".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            with open(REGISTRY, "a") as f:
-                f.write(tmp + "\n")
+            lines = REGISTRY.read_text().splitlines()
         except OSError:
-            pass
+            lines = []
+        entries = [l.split("\t", 1) if "\t" in l else ["0", l] for l in lines if l]  # old lines: no pid
+        yield entries
+        REGISTRY.write_text("".join(f"{pid}\t{path}\n" for pid, path in entries))
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        pass
+    return int(pid) > 0
+
+
+@contextlib.contextmanager
+def _registered(tmp):
+    """Record in-progress temp folders, so one whose process was killed
+    mid-conversion can be removed from beside the user's files later."""
+    try:
+        with _registry() as entries:
+            entries.append([str(os.getpid()), tmp])
+    except OSError:
+        pass
     _job.work = Path(tmp) / "work"  # this thread's magick calls spill here
     try:
         yield
     finally:
         _job.work = None
-        with _registry_lock:
-            try:
-                left = [l for l in REGISTRY.read_text().splitlines() if l and l != tmp]
-                REGISTRY.write_text("".join(l + "\n" for l in left))
-            except OSError:
-                pass
+        try:
+            with _registry() as entries:
+                entries[:] = [e for e in entries if e[1] != tmp]
+        except OSError:
+            pass
 
 
 def sweep_leftovers():
-    """Called once at daemon start: remove temp folders of conversions that died."""
-    with _registry_lock:
-        try:
-            paths = REGISTRY.read_text().splitlines()
-        except OSError:
-            return
-        for path in paths:
-            p = Path(path)
-            # (".convert-ring-": folders left by this tool under its old name)
-            if p.name.startswith((".prism-", ".convert-ring-")) and p.is_dir() and not p.is_symlink():
-                shutil.rmtree(p, ignore_errors=True)
-        REGISTRY.write_text("")
+    """Remove temp folders of conversions whose process died (daemon start, and
+    after a worker is killed). Live jobs, e.g. a crop window saving, are kept."""
+    try:
+        with _registry() as entries:
+            dead = [e for e in entries if not _alive(e[0])]
+            for _pid, path in dead:
+                p = Path(path)
+                # (".convert-ring-": folders left by this tool under its old name)
+                if p.name.startswith((".prism-", ".convert-ring-")) and p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p, ignore_errors=True)
+            entries[:] = [e for e in entries if e not in dead]
+    except OSError:
+        pass
 
 
 def convert(src, ext):
@@ -1012,3 +1091,44 @@ def convert(src, ext):
                                             else f".{_compressed_ext(src)}"}
                                            if ext in COMPRESS else {}))
     return ConversionResult(saved, warnings)
+
+
+# Each conversion runs in its own process (convert_isolated), so whatever a
+# hostile or huge file does to memory hits a worker, never the resident ring;
+# under systemd the worker is also in its own scope with a hard memory cap.
+WORKER_MEMORY = "3G"
+
+
+def convert_isolated(src, ext):
+    """convert(), in a memory-capped worker process. Same result or RuntimeError."""
+    env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")}
+    worker = ["/usr/bin/python3", str(BASE / "convert.py"), "--job", str(src), ext]
+    if shutil.which("systemd-run") and env.get("DBUS_SESSION_BUS_ADDRESS"):
+        worker = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                  "-p", f"MemoryMax={WORKER_MEMORY}", "-p", "MemorySwapMax=0", "--", *worker]
+    proc = subprocess.run(worker, env=env, capture_output=True, text=True, errors="replace")
+    try:
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        result = None
+    if proc.returncode == 0 and result and "path" in result:
+        return ConversionResult(result["path"], result.get("warnings", ()))
+    sweep_leftovers()  # a killed worker leaves its temp folder behind
+    if result and "error" in result:
+        raise RuntimeError(result["error"])
+    if proc.returncode in (-9, 137):
+        raise RuntimeError(f"Ran out of memory (a conversion may use {WORKER_MEMORY}B); nothing was saved")
+    detail = proc.stderr.strip().splitlines()
+    raise RuntimeError(detail[-1] if detail else f"The conversion stopped unexpectedly ({proc.returncode})")
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:2] != ["--job"] or len(sys.argv) != 4:
+        sys.exit("convert.py --job SRC TARGET  (used by the ring; prints a JSON result)")
+    try:
+        saved = convert(sys.argv[2], sys.argv[3])
+        print(json.dumps({"path": str(saved), "warnings": list(saved.warnings)}))
+    except Exception as e:  # every failure is reported, as the ring's notification
+        print(json.dumps({"error": str(e) or type(e).__name__}))
+        sys.exit(1)

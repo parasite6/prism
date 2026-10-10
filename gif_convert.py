@@ -84,14 +84,15 @@ def _merge(chunks, out):
 
 
 def _worker_count(stream, out):
+    """Return (workers, frame cap, cache byte cap) for the checked duration."""
     cpus = len(os.sched_getaffinity(0))
     if cpus < 2:
-        return 1
+        return 1, 0, 0
     try:
         width, height = int(stream["width"]), int(stream["height"])
         duration = float(stream.get("duration", 0))
         if min(width, height) <= 0 or duration <= 0 or not math.isfinite(duration):
-            return 1
+            return 1, 0, 0
         for side_data in stream.get("side_data_list", []):
             if abs(float(side_data.get("rotation", 0))) % 180 == 90:
                 width, height = height, width
@@ -103,32 +104,46 @@ def _worker_count(stream, out):
         fmt = stream.get("pix_fmt", "")
         alpha = fmt.startswith(("yuva", "gbrap")) or fmt in {"rgba", "bgra", "argb", "abgr"}
         if alpha or pixels < 24_000_000 or cache_bytes > MAX_CACHE:
-            return 1
+            return 1, 0, 0
         if shutil.disk_usage(out.parent).free < cache_bytes * 2 + 64 * 1024 ** 2:
-            return 1
+            return 1, 0, 0
     except (KeyError, ValueError, OverflowError, OSError):
-        return 1
-    return min(4, cpus)
+        return 1, 0, 0
+    return min(4, cpus), frames, cache_bytes
+
+
+def _single_pass(src, out, stream, run):
+    run(["ffmpeg", "-n", "-loglevel", "error", "-i", str(src), "-map", f"0:{stream['index']}",
+         "-vf", GRAPH, str(out)], timeout=6 * 3600)
 
 
 def convert_gif(src, out, stream, run):
-    workers = _worker_count(stream, out)
+    workers, frames, cache_bytes = _worker_count(stream, out)
     if workers == 1:
-        run(["ffmpeg", "-n", "-loglevel", "error", "-i", str(src), "-map", f"0:{stream['index']}",
-             "-vf", GRAPH, str(out)], timeout=6 * 3600)
+        _single_pass(src, out, stream, run)
         return
     with tempfile.TemporaryDirectory(prefix="gif-work-", dir=out.parent.parent) as tmp:
         work = Path(tmp)
         cache, palette = work / "frames.nut", work / "palette.png"
         # Decode and scale once; use lossless raw frames and the same full-video
         # palette as the existing filter graph. No dithering/quality tradeoff.
+        # The header duration sized the checks above, so stop decoding at that
+        # many frames (trim) and never write more than was checked (-fs).
+        limit = cache_bytes + 1024 ** 2
         run(["ffmpeg", "-n", "-loglevel", "error", "-filter_complex_threads", "2", "-i", str(src),
-             "-filter_complex", f"[0:{stream['index']}]" + SCALE + ",format=bgra,split[v][p];[p]palettegen[pal]",
-             "-map", "[v]", "-c:v", "rawvideo", "-threads:v", "1", str(cache),
+             "-filter_complex", f"[0:{stream['index']}]" + SCALE + f",trim=end_frame={frames}"
+             ",format=bgra,split[v][p];[p]palettegen[pal]",
+             "-map", "[v]", "-c:v", "rawvideo", "-threads:v", "1", "-fs", str(limit), str(cache),
              "-map", "[pal]", "-frames:v", "1", "-threads:v", "1", str(palette)], timeout=6 * 3600)
         info = json.loads(run(["ffprobe", "-v", "error", "-count_packets", "-show_entries",
                                "stream=nb_read_packets", "-of", "json", str(cache)]))
         count = int(info["streams"][0]["nb_read_packets"])
+        if count >= frames or cache.stat().st_size >= limit:
+            # Longer than its header says: the cache is truncated. Encode the
+            # whole video in one pass instead of shipping a cut-short GIF.
+            cache.unlink()
+            _single_pass(src, out, stream, run)
+            return
         if count < 1:
             raise RuntimeError("The video produced no GIF frames")
         # Fifteen FPS uses a three-frame delay cycle in GIF's centisecond clock.

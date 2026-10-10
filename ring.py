@@ -338,6 +338,7 @@ class Ring(Gtk.ApplicationWindow):
     armed = True
     hover_since = 0.0
     polled_at = 0.0
+    probing = False
     ring_origin = (0, 0)  # where the ring layer sits (update_layers)
 
     def __init__(self, app):
@@ -412,6 +413,7 @@ class Ring(Gtk.ApplicationWindow):
         self.holding = self.from_hold = holding
         self.pressed_at = self.touched_at = time.monotonic()
         self.files, self.targets, self.pop = [], [], []
+        self.probing = False
         self.thumb = None
         self.size_text = self.name_text = ""
         self.result = None
@@ -452,10 +454,30 @@ class Ring(Gtk.ApplicationWindow):
             if time.monotonic() < self.ignore_files_until:
                 return  # late selection for a hold that was already released
             self.begin(holding=False)
-        elif self.targets or self.phase not in ("open", "idle"):
+        elif self.targets or self.probing or self.phase not in ("open", "idle"):
             return  # one selection per session
-        files = [f for f in files if os.path.isfile(f)]
-        targets = convert.targets_for(files) if files else []
+        # Reading the files' headers is off the UI thread: a slow disk or a
+        # hostile file must never freeze the ring while it holds the keyboard.
+        # Esc still works meanwhile, and the NO_FILES watchdog still applies.
+        self.probing = True
+        session = self.session
+
+        def probe():
+            try:
+                found = [f for f in files if os.path.isfile(f)]
+                targets = convert.targets_for(found) if found else []
+                size = sum(os.path.getsize(f) for f in found)
+            except Exception:  # (deleted mid-way, unreadable): treat as nothing convertible
+                found, targets, size = [], [], None
+            GLib.idle_add(self.apply_files, session, found, targets, size)
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    @guarded(fallback=False)
+    def apply_files(self, session, files, targets, size):
+        if session != self.session or not self.active or self.phase not in ("open", "idle"):
+            return False  # that ring already closed (or a new one opened)
+        self.probing = False
         if not targets:
             self.end()
             # Forward in Nautilus with nothing convertible selected is ordinary
@@ -478,10 +500,7 @@ class Ring(Gtk.ApplicationWindow):
             self.menus = {"main": main}
         self.files, self.targets = files, main
         self.pop = [0.0] * len(main)
-        try:
-            self.size_text = GLib.format_size(sum(os.path.getsize(f) for f in files))
-        except OSError:
-            self.size_text = ""
+        self.size_text = GLib.format_size(size) if size is not None else ""
         name = os.path.basename(files[0])
         self.name_text = short_name(name) + (f" +{len(files) - 1}" if len(files) > 1 else "")
         self.set_hover(self.slice_at(self.px, self.py))
@@ -492,6 +511,7 @@ class Ring(Gtk.ApplicationWindow):
             GLib.idle_add(lambda: setattr(self, "thumb", thumb) if self.session == session else None)
 
         threading.Thread(target=load, daemon=True).start()
+        return False
 
     def release(self):
         """The held button came up: pick, cancel, or (a tap) stay open for clicks."""
@@ -980,7 +1000,7 @@ class App(Gtk.Application):
             global BUSY
             try:
                 with ThreadPoolExecutor(max_workers=min(4, len(files))) as pool:
-                    jobs = [(f, pool.submit(convert.convert, f, ext)) for f in files]
+                    jobs = [(f, pool.submit(convert.convert_isolated, f, ext)) for f in files]
                 report(jobs, ext)
             finally:
                 with BUSY_LOCK:

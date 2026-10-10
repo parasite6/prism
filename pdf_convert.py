@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Run only in the isolated PDF environment; never import into the GTK process."""
+import re
 import sys
 from pathlib import Path
 
@@ -21,9 +22,49 @@ def main(src, out):
     from pdf2docx import Converter
     converter = Converter(src)
     try:
-        converter.convert(out, multi_processing=False)
+        # pdf2docx's default skips a page that fails and still reports success.
+        converter.convert(out, multi_processing=False, ignore_page_error=False)
+    except Exception as exc:
+        Path(out).unlink(missing_ok=True)
+        page = re.search(r"Error when (?:parsing|make) page (\d+)", str(exc))
+        raise RuntimeError(f"Page {page[1]} could not be converted; nothing was saved" if page
+                           else "This PDF could not be converted; nothing was saved") from exc
     finally:
         converter.close()
+
+
+def _value(pdf, xref, key):
+    kind, value = pdf.xref_get_key(xref, key)
+    if kind == "xref":  # indirect, e.g. /Filter 12 0 R
+        value = pdf.xref_object(int(value.split()[0]), compressed=True)
+    return value
+
+
+def _clean_jpeg(pdf, xref, filters):
+    """Strip EXIF/APPn/COM from a JPEG image stream, also one under outer filters
+    (/Filter [/FlateDecode /DCTDecode]). Fail closed: never leave one uncleaned."""
+    from scrub import strip_jpeg
+
+    failed = RuntimeError("An image in this PDF could not be cleaned; output was not saved")
+    if filters[-1] != "DCTDecode" or filters.count("DCTDecode") > 1 or not pdf.is_stream(xref):
+        raise failed
+    transform = re.search(r"/ColorTransform\s*(\d)", _value(pdf, xref, "DecodeParms"))
+    try:
+        if len(filters) == 1:
+            jpeg = pdf.xref_stream_raw(xref)
+        else:  # xref_stream decodes the whole chain to pixels: drop DCT so it stops at the JPEG.
+            # DCT is last, so the outer filters keep their DecodeParms by position.
+            pdf.xref_set_key(xref, "Filter", "[" + "".join("/" + f for f in filters[:-1]) + "]")
+            jpeg = pdf.xref_stream(xref)
+        if jpeg[:2] != b"\xff\xd8":
+            raise ValueError
+        clean = strip_jpeg(jpeg)
+    except Exception:
+        raise failed from None
+    if clean != jpeg or len(filters) > 1:
+        pdf.update_stream(xref, clean, compress=0)
+        pdf.xref_set_key(xref, "Filter", "/DCTDecode")
+        pdf.xref_set_key(xref, "DecodeParms", f"<</ColorTransform {transform[1]}>>" if transform else "null")
 
 
 def scrub(path):
@@ -31,7 +72,6 @@ def scrub(path):
     thumbnails, EXIF inside embedded JPEGs. Full rewrite, so nothing old
     survives in an incremental-update section."""
     import pymupdf
-    from scrub import strip_jpeg
 
     tmp = Path(path).with_name(Path(path).name + ".scrub")
     with pymupdf.open(path) as pdf:
@@ -40,15 +80,9 @@ def scrub(path):
                   reset_fields=False, reset_responses=True, thumbnails=True, xml_metadata=True)
         pdf.set_metadata({})
         for xref in range(1, pdf.xref_length()):
-            if pdf.xref_get_key(xref, "Filter") == ("name", "/DCTDecode"):
-                raw = pdf.xref_stream_raw(xref)
-                try:
-                    clean = strip_jpeg(raw)
-                except ValueError:
-                    raise RuntimeError("An image in this PDF could not be read; output was not saved") from None
-                if clean != raw:
-                    pdf.update_stream(xref, clean, compress=0)
-                    pdf.xref_set_key(xref, "Filter", "/DCTDecode")
+            filters = re.findall(r"/(\w+)", _value(pdf, xref, "Filter"))
+            if "DCTDecode" in filters:  # bare name, [/DCTDecode] or a chain ending in it
+                _clean_jpeg(pdf, xref, filters)
             for key in ("CreationDate", "ModDate", "M", "LastModified"):  # stray dates on any object
                 if pdf.xref_get_key(xref, key)[0] == "string":
                     pdf.xref_set_key(xref, key, "null")

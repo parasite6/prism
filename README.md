@@ -86,8 +86,12 @@ unscrubbed.
 ## Untrusted files
 
 Files to convert often come from the internet, so a file can't pull anything
-else in:
+else in, phone home, or take the desktop down with it:
 
+- LibreOffice and FFmpeg run in a bubblewrap sandbox with no network, no home
+  folder and no input devices. Of your files, they see only the one being
+  converted (read-only) and the job's temp folder. A document's linked images
+  and a video "manifest" posing as `.mp4` find nothing else to read.
 - ImageMagick is limited, by `magick/policy.xml`, to the formats Prism handles.
   A renamed PostScript, MSL or MVG file can't run Ghostscript, read local files
   or fetch URLs, and no external delegate (Inkscape, LibreOffice...) is started.
@@ -95,6 +99,12 @@ else in:
   their own media, and `data:` URIs. An image pointing to `~/.ssh/...`, `../..`
   or a URL is dropped, keeping its alt text, and so is raw HTML or CSS that
   could load something (`safe-resources.lua`).
+- Each conversion runs in its own worker process, capped at 3 GB of memory
+  (a systemd scope), so a hostile file can't exhaust memory for the ring or
+  the desktop. Compressed parts of documents and images are never inflated
+  without a limit either.
+- File headers are read off the ring's UI thread, with a bounded walk, so a
+  crafted file can't freeze the ring while it holds the keyboard.
 
 Inputs are never modified, except by the crop tool's Replace. Outputs are
 numbered rather than overwriting anything, and a failed conversion leaves
@@ -107,7 +117,7 @@ Fedora with Hyprland 0.56+ (Lua config) and Nautilus. Dependencies:
 ```sh
 sudo dnf install python3-gobject python3-cairo gtk4 gtk4-layer-shell ImageMagick ffmpeg \
     libheif-tools pandoc libreoffice poppler-utils pngquant oxipng gifsicle wl-clipboard \
-    libnotify perl-Image-ExifTool
+    libnotify perl-Image-ExifTool bubblewrap
 ```
 
 The `ffmpeg` package must be the full build (RPM Fusion, with libx264, libvpx,
@@ -141,7 +151,8 @@ git clone https://github.com/parasite6/prism && cd prism
 
 It is safe to re-run after an update. Everything runs on `/usr/bin/python3`, so
 other Pythons on `PATH` are never picked up. Conversions run at background
-priority, and ImageMagick is capped at 768 MiB of RAM.
+priority, and ImageMagick is capped at 768 MiB of RAM. `bubblewrap` is required:
+without it, document and video conversions refuse to run rather than run unsandboxed.
 
 ## Tests
 

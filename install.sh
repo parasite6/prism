@@ -67,12 +67,18 @@ touch "$HYPR_CUSTOM"
 # Replace any entry from an earlier location or the old name.
 sed -i -E '\#^dofile\(".*/(convert-ring|prism)/hypr-binds\.lua"\)$#d' "$HYPR_CUSTOM"
 echo "$LINE" >> "$HYPR_CUSTOM"
-# Restart the resident ring so it runs from this location.
-# Make sure the old one is really gone (a stuck ring once survived this silently).
+# Restart the resident ring so it runs from this location. On SIGTERM it
+# finishes running conversions first (up to 2 minutes): wait for that rather
+# than cutting them off, but make sure it is really gone in the end (a stuck
+# ring once survived a restart silently).
 for pid in $(pgrep -f '/(convert-ring|prism)/ring.py --daemon$'); do
     kill "$pid" 2>/dev/null
-    for _ in $(seq 20); do [ -e "/proc/$pid" ] || break; sleep 0.05; done
-    [ -e "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null
+    for i in $(seq 1300); do  # 130 s
+        [ -e "/proc/$pid" ] || break
+        [ "$i" = 10 ] && echo "Waiting for running conversions to finish (up to 2 minutes)..."
+        sleep 0.1
+    done
+    [ -e "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null && echo "The old ring didn't stop; it was killed." >&2
 done
 rm -f "${XDG_RUNTIME_DIR:-/tmp}/convert-ring.pid" "${XDG_RUNTIME_DIR:-/tmp}/prism.pid"
 hyprctl reload >/dev/null && echo "Hyprland reloaded: hold Forward on a selected file in Nautilus."

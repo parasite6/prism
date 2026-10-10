@@ -21,6 +21,21 @@ CLEAN_AT_SOURCE = {"avif", "heic", "heif", "ico", "bmp", "tif", "tiff", "svg", "
                    "markdown", "rtf", "txt", "csv", "wmf", "wmz"}
 OFFICE = {"docx", "xlsx", "pptx", "odt", "ods", "odp"}
 JPEG = {"jpg", "jpeg", "jpe", "jfif"}
+# Never inflate untrusted data without a bound: a few-KB zip entry, colour
+# profile or .emz can expand to gigabytes (~1000:1).
+MAX_MEMBER = 512 * 1024 ** 2  # one zip member, uncompressed (embedded video in a deck is real)
+MAX_RATIO = 100  # beyond this, a big member is a decompression bomb, not media or XML
+MAX_INFLATE = 64 * 1024 ** 2  # an ICC profile or EMF picture
+MAX_NESTING = 4  # packages inside packages inside...
+
+
+def _inflate(data, wbits=15):
+    """zlib/gzip data, refusing anything that expands past MAX_INFLATE."""
+    inflater = zlib.decompressobj(wbits)
+    out = inflater.decompress(data, MAX_INFLATE)
+    if inflater.unconsumed_tail:
+        raise ValueError("compressed data expands too far")
+    return out
 
 
 def strip_jpeg(data):
@@ -193,9 +208,9 @@ def needs_pixels(data):
                 exif = body
             elif kind == b"iCCP":
                 try:
-                    icc = zlib.decompress(body[body.index(b"\0") + 2:])
+                    icc = _inflate(body[body.index(b"\0") + 2:])
                 except (ValueError, zlib.error):
-                    return True
+                    return True  # unreadable or oversized: re-encode (ImageMagick has limits)
             i += 12 + length
     elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         i = 12
@@ -280,8 +295,8 @@ def strip_emf(data):
 def strip_image_bytes(data):
     if data[:2] == b"\x1f\x8b":  # .emz: a gzipped EMF
         try:
-            inner = gzip.decompress(data)
-        except (OSError, EOFError):
+            inner = _inflate(data, wbits=31)
+        except zlib.error:
             return data
         clean = strip_emf(inner)
         return data if clean == inner else gzip.compress(clean, mtime=0)
@@ -345,10 +360,10 @@ def _scrub_xml(name, data):
     return data
 
 
-def _strip_package_bytes(data):
+def _strip_package_bytes(data, depth):
     try:
         out = io.BytesIO()
-        _strip_package(io.BytesIO(data), out)
+        _strip_package(io.BytesIO(data), out, depth)
         return out.getvalue()
     except zipfile.BadZipFile:
         return data  # not actually a zip: leave it
@@ -362,17 +377,26 @@ def strip_office(path):
     except zipfile.BadZipFile:
         tmp.unlink(missing_ok=True)
         raise RuntimeError("This document is password-protected or damaged; output was not saved") from None
+    except ValueError:
+        tmp.unlink(missing_ok=True)
+        raise  # scrub_tree: "could not read ... to remove its metadata"
     tmp.replace(path)
 
 
-def _strip_package(source, target):
+def _strip_package(source, target, depth=0):
+    if depth > MAX_NESTING:
+        raise ValueError("packages nested too deeply")
     with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
         for item in src.infolist():
+            # zipfile never inflates past the declared size, so checking it bounds memory.
+            if item.file_size > MAX_MEMBER or (item.file_size > 64 * 1024 ** 2
+                                               and item.file_size > MAX_RATIO * max(1, item.compress_size)):
+                raise ValueError(f"{item.filename} is too large to clean")
             data = src.read(item.filename)
             if item.filename.endswith((".xml", ".rels")):
                 data = _scrub_xml(item.filename, data)
             elif data[:2] == b"PK":  # embedded package (chart data, OLE spreadsheet)
-                data = _strip_package_bytes(data)
+                data = _strip_package_bytes(data, depth + 1)
             elif re.search(r"printerSettings\d*\.bin$", item.filename) and len(data) >= 64:
                 data = bytes(64) + data[64:]  # DEVMODE: the printer's name
             elif not item.is_dir():

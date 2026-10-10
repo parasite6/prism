@@ -307,8 +307,13 @@ class RingGeometryTests(unittest.TestCase):
                 break
             exec(compile(ast.Module(body=[n], type_ignores=[]), "<look>", "exec"), look)
         stub = type("Stub", (), {"__getattr__": lambda self, name: self, "__call__": lambda self, *a, **k: self})()
+        # Synchronous stand-ins: set_files probes in a thread and hands back via idle_add.
+        glib = type("GLib", (), {"idle_add": staticmethod(lambda fn, *a: fn(*a)),
+                                 "format_size": staticmethod(lambda n: f"{n} B"), "__getattr__": lambda *a: stub})()
+        sync = type("Threading", (), {"Thread": staticmethod(lambda target, daemon=None: type(
+            "T", (), {"start": staticmethod(target)})())})()
         namespace = {"math": math, "cairo": cairo, "convert": convert, "os": os, "time": __import__("time"),
-                     "GLib": stub, "threading": stub, "thumbnail": lambda f: None, "notify": lambda *a: None,
+                     "GLib": glib, "threading": sync, "thumbnail": lambda f: None, "notify": lambda *a: None,
                      **look}
         cls.Logic = ring_nodes(namespace, "guarded", "Ring", "mix", "centred_text", "pill", "paint_cover",
                                "rounded_rect", "short_name", prefix="ease_")["Ring"]
@@ -362,7 +367,7 @@ class RingMenuTests(unittest.TestCase):
 
     def opened(self, files):
         obj = self.logic()
-        obj.targets, obj.phase, obj.from_hold, obj.session = [], "open", True, 1
+        obj.targets, obj.phase, obj.from_hold, obj.session, obj.probing = [], "open", True, 1, False
         obj.parent, obj.rot, obj.armed = None, 0.0, True
         obj.set_files([str(f) for f in files])
         return obj
@@ -400,6 +405,17 @@ class RingMenuTests(unittest.TestCase):
             self.assertFalse(obj.armed)
             obj.switch_menu(0)
             self.assertEqual(obj.targets, ["convert", "clean"])
+
+    def test_late_probe_result_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self.make(tmp, "a.png")
+            obj = self.logic()
+            obj.targets, obj.phase, obj.active = [], "open", True
+            obj.session = 2  # the ring that asked (session 1) is gone; a new one is open
+            obj.probing = True
+            obj.apply_files(1, [str(png)], ["jpg", "clean"], 10)
+            self.assertEqual(obj.targets, [])
+            self.assertTrue(obj.probing)  # still waiting for its own selection
 
     def test_every_target_reachable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -724,6 +740,97 @@ class HostileInputTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1", html_out)
         self.assertIn("and text", html_out)
 
+    # A .docx whose only image is an external link (LibreOffice resolves those).
+    CT = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+    </Types>"""
+
+    RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+    </Relationships>"""
+
+    DOC_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="TARGET" TargetMode="External"/>
+    </Relationships>"""
+
+    DOC = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+     xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+     xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+    <w:body>
+    <w:p><w:r><w:t>Hello, harmless document.</w:t></w:r></w:p>
+    <w:p><w:r><w:drawing>
+    <wp:inline distT="0" distB="0" distL="0" distR="0">
+    <wp:extent cx="1828800" cy="914400"/>
+    <wp:docPr id="1" name="Picture 1"/>
+    <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+    <pic:pic>
+    <pic:nvPicPr><pic:cNvPr id="1" name="secret.png"/><pic:cNvPicPr/></pic:nvPicPr>
+    <pic:blipFill><a:blip r:link="rId9"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+    <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+    </pic:pic>
+    </a:graphicData></a:graphic>
+    </wp:inline>
+    </w:drawing></w:r></w:p>
+    <w:sectPr/>
+    </w:body>
+    </w:document>"""
+
+    def linked_docx(self, name, target):
+        path = self.folder / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", self.CT)
+            z.writestr("_rels/.rels", self.RELS)
+            z.writestr("word/_rels/document.xml.rels", self.DOC_RELS.replace("TARGET", target))
+            z.writestr("word/document.xml", self.DOC)
+        return path
+
+    def test_office_documents_cannot_embed_linked_local_files(self):
+        for name, target in (("abs.docx", (self.outside / "secret.png").as_uri()), ("rel.docx", "../private/secret.png")):
+            out = convert.convert(str(self.linked_docx(name, target)), "pdf")
+            listing = subprocess.run(["pdfimages", "-list", out], capture_output=True, text=True).stdout
+            self.assertNotIn(" 13     7 ", listing, name)  # the 13x7 secret is not in the PDF
+
+    def test_video_manifest_cannot_read_other_videos(self):
+        secret = self.outside / "secret.mp4"
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=64x48:d=1",
+                        "-c:v", "libx264", str(secret)], check=True)
+        for base in (secret.as_uri(), str(secret), "../private/secret.mp4"):
+            clip = self.folder / "clip.mp4"
+            clip.write_text('<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" '
+                            'mediaPresentationDuration="PT1S" minBufferTime="PT1S" '
+                            'profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"><Period><AdaptationSet '
+                            'mimeType="video/mp4"><Representation id="1" bandwidth="1000">'
+                            f'<BaseURL>{base}</BaseURL><SegmentBase/></Representation></AdaptationSet></Period></MPD>')
+            with self.assertRaises(RuntimeError, msg=base):
+                convert.convert(str(clip), "webm")
+
+    def test_sandbox_has_no_network_home_or_input_devices(self):
+        import socket
+        server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(1)
+        probe = ("import socket, os\n"
+                 f"for host, port in (('127.0.0.1', {server.getsockname()[1]}), ('1.1.1.1', 443)):\n"
+                 "    s = socket.socket(); s.settimeout(2)\n"
+                 "    try: s.connect((host, port)); print('REACHED', host)\n"
+                 "    except OSError: pass\n"
+                 f"home = {str(Path.home())!r}\n"
+                 "print(sorted(os.listdir(home)) if os.path.isdir(home) else [], os.path.exists('/dev/input'))\n")
+        out = subprocess.run(convert._sandbox(["/usr/bin/python3", "-c", probe], None),
+                             capture_output=True, text=True).stdout
+        server.close()
+        visible, devices = out.strip().rsplit(" ", 1)
+        self.assertNotIn("REACHED", out)
+        self.assertEqual(devices, "False")
+        # Only the skeleton bubblewrap makes for the font folders it shares.
+        self.assertTrue(set(eval(visible)) <= {".local", ".cache", ".fonts"}, visible)
+
     def test_renamed_postscript_is_not_run(self):
         src = self.folder / "photo.png"
         src.write_text("%!PS\n/Helvetica findfont 20 scalefont setfont 10 10 moveto (hi) show showpage\n")
@@ -806,6 +913,39 @@ class BindingTests(unittest.TestCase):
         self.feed(w, "kbd", (29, 1), (56, 1), (30, 1), (30, 2), (30, 2), (30, 0))
         self.assertEqual(w.changes, [True, False])
         self.assertEqual(w.codes, {30, 29, 97, 56, 100})  # what the kernel mask lets through
+
+
+class RegistryTests(unittest.TestCase):
+    """The temp-folder registry is shared by the daemon, workers and crop windows."""
+    def test_sweep_removes_only_dead_jobs(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            live, dead, old = (folder / f".prism-{n}" for n in ("live", "dead", "old"))
+            for f in (live, dead, old):
+                f.mkdir()
+            gone = subprocess.Popen(["true"]); gone.wait()  # a pid that no longer exists
+            registry = folder / "prism.jobs"
+            registry.write_text(f"{os.getpid()}\t{live}\n{gone.pid}\t{dead}\n{old}\n")  # old format: no pid
+            with patch.object(convert, "REGISTRY", registry):
+                convert.sweep_leftovers()
+            self.assertTrue(live.is_dir())  # e.g. a crop window still saving
+            self.assertFalse(dead.exists())
+            self.assertFalse(old.exists())
+            self.assertEqual(registry.read_text(), f"{os.getpid()}\t{live}\n")
+
+    def test_concurrent_processes_do_not_lose_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            registry = Path(d) / "prism.jobs"
+            code = ("import sys, convert\nfrom pathlib import Path\nconvert.REGISTRY = Path(sys.argv[1])\n"
+                    "for i in range(200):\n"
+                    "    with convert._registered(sys.argv[2] + str(i)): pass\n"
+                    "with convert._registry() as e: e.append(['1', sys.argv[2] + 'kept'])\n")
+            procs = [subprocess.Popen([sys.executable, "-c", code, str(registry), f"/x/{n}-"], cwd=ROOT)
+                     for n in range(4)]
+            for proc in procs:
+                self.assertEqual(proc.wait(), 0)
+            self.assertEqual(sorted(registry.read_text().split()),
+                             sorted(["1", "1", "1", "1", *(f"/x/{n}-kept" for n in range(4))]))
 
 
 class InstallerTests(unittest.TestCase):
