@@ -78,7 +78,7 @@ class ConversionTests(unittest.TestCase):
                 "p.insert_text((72,72),'Preserved document text.'); "
                 "p.insert_image(pymupdf.Rect(72,100,250,278),filename=sys.argv[1]); "
                 "d.save(sys.argv[2])")
-        run([str(ROOT / ".pdf-venv/bin/python"), "-c", code, str(image), str(src)])
+        run([str(convert._pdf_python()), "-c", code, str(image), str(src)])
         out = Path(convert.convert(str(src), "md"))
         self.assertTrue(out.is_dir())
         markdown = next(out.glob("*.md")).read_text()
@@ -630,7 +630,7 @@ class CleanTests(unittest.TestCase):
                 "(d.xref_set_key(int(a[1].split()[0]),'Fields',f'[{par} 0 R]') if a[0]=='xref' "
                 "else d.xref_set_key(c,'AcroForm/Fields',f'[{par} 0 R]'));"
                 "d.set_metadata({'author':'ZZSECRETZZ'}); d.save(sys.argv[1])")
-        python = str(ROOT / ".pdf-venv/bin/python")
+        python = str(convert._pdf_python())
         run([python, "-c", code, str(src)])
         out = convert.convert(str(src), "clean")
         names = run([python, "-c", "import pymupdf,sys; print([w.field_name for p in pymupdf.open(sys.argv[1]) "
@@ -818,15 +818,18 @@ class InstallerTests(unittest.TestCase):
                 fake = bin_dir / name
                 fake.write_text("#!/bin/sh\nexit 0\n"); fake.chmod(0o755)
             runtime = folder / "run"; runtime.mkdir()
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime),
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
             run(["bash", str(ROOT / "install.sh")], env=env)
             launcher = folder / "data/nautilus/scripts/Prism"
             self.assertTrue(launcher.is_symlink())
-            self.assertEqual(launcher.resolve(), ROOT / "prism")
+            installed = folder / "data/prism"  # copied there, not run from the repo
+            self.assertEqual(launcher.resolve(), installed / "prism")
+            self.assertTrue((installed / "ring.py").is_file())
+            self.assertFalse((installed / ".git").exists())
             self.assertTrue((folder / "config/nautilus/scripts-accels").is_file())
             desktop = (folder / "data/applications/dev.prism.Bind.desktop").read_text()
-            self.assertIn(f'Exec="{ROOT}/prism-bind"', desktop)
+            self.assertIn(f'Exec="{installed}/prism-bind"', desktop)
 
 
     def test_installer_takes_over_from_the_old_name(self):
@@ -844,14 +847,34 @@ class InstallerTests(unittest.TestCase):
             accels.write_text("<Control><Alt>c Convert\n<Control>F5 Mine\n")
             custom = folder / ".config/hypr/custom.lua"; custom.parent.mkdir(parents=True)
             custom.write_text('hl.config({})\ndofile("/home/x/.local/share/convert-ring/hypr-binds.lua")\n')
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime),
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
+            installed = folder / "data/prism"
+            (installed / ".pdf-venv").mkdir(parents=True)
+            (installed / ".pdf-venv/keep").write_text("x")
+            (installed / "ring.py").write_text("# an older install")
+            (installed / "removed-from-repo.py").write_text("x")
             run(["bash", str(ROOT / "install.sh")], env=env)
             run(["bash", str(ROOT / "install.sh")], env=env)  # re-running changes nothing more
+            self.assertTrue((installed / ".pdf-venv/keep").is_file())  # never deleted
+            self.assertFalse((installed / "removed-from-repo.py").exists())
+            self.assertEqual((installed / "ring.py").read_bytes(), (ROOT / "ring.py").read_bytes())
             self.assertEqual(sorted(p.name for p in scripts.iterdir()), ["Mine", "Prism"])
             self.assertEqual(accels.read_text(), "<Control>F5 Mine\n<Control><Alt>c Prism\n")
-            self.assertEqual(custom.read_text(), f'hl.config({{}})\ndofile("{ROOT}/hypr-binds.lua")\n')
+            self.assertEqual(custom.read_text(), f'hl.config({{}})\ndofile("{folder}/data/prism/hypr-binds.lua")\n')
 
+
+    def test_installer_refuses_a_folder_that_is_not_prism(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            target = folder / "data/prism"; target.mkdir(parents=True)
+            (target / "notes.txt").write_text("someone else's")
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), PRISM_SKIP_PDF="1",
+                       XDG_RUNTIME_DIR=d, XDG_CONFIG_HOME=str(folder / "config"))
+            result = subprocess.run(["bash", str(ROOT / "install.sh")], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("isn't a Prism install", result.stderr)
+            self.assertEqual([p.name for p in target.iterdir()], ["notes.txt"])
 
 if __name__ == "__main__":
     unittest.main()

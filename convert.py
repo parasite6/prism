@@ -442,10 +442,12 @@ def _document(src, ext, out, payload, work):
 
 
 def _pdf_python():
-    python = BASE / ".pdf-venv/bin/python"
-    if not python.is_file():
-        raise RuntimeError("PDF dependencies are missing. Run setup-pdf.sh first.")
-    return python
+    # A repo checkout has none of its own: it uses the installed copy's (install.sh).
+    installed = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "prism"
+    for python in (BASE / ".pdf-venv/bin/python", installed / ".pdf-venv/bin/python"):
+        if python.is_file():
+            return python
+    raise RuntimeError("PDF dependencies are missing. Run install.sh (or setup-pdf.sh) first.")
 
 
 def _scrub_pdf(path):

@@ -119,21 +119,24 @@ the kernel for the binding's keys only, so typing and mouse movement never
 reach it. `exiftool` is optional; it lets CLEAN
 strip AVIF and HEIC losslessly.
 
-Copy the folder somewhere permanent, then run:
+Then, from the repo:
 
 ```sh
-cp -r prism ~/.local/share/prism
-~/.local/share/prism/setup-pdf.sh   # once: PDF libraries in .pdf-venv
-~/.local/share/prism/install.sh
+git clone https://github.com/parasite6/prism && cd prism
+./install.sh
 ```
 
-`install.sh` does the following:
+`install.sh` is the only step, and you re-run it after pulling an update. It:
 
+- copies the code to `~/.local/share/prism`, so the running ring never sees a
+  half-edited checkout;
+- the first time, sets up the PDF libraries in `.pdf-venv` (about 450 MB from
+  PyPI) with `setup-pdf.sh`;
 - links the Nautilus script and adds the Ctrl+Alt+C accelerator;
 - adds **Prism: Set Shortcut** to the app launcher;
 - adds a `dofile` of `hypr-binds.lua` to `~/.config/hypr/custom.lua`, which
-  starts the ring with the session, blurs the ring's layer, and stops Forward
-  from also navigating in Nautilus;
+  starts the ring with the session, blurs the ring's layer, and stops the
+  binding from also reaching Nautilus;
 - restarts the ring and reloads Hyprland.
 
 It is safe to re-run after an update. Everything runs on `/usr/bin/python3`, so
@@ -143,8 +146,7 @@ priority, and ImageMagick is capped at 768 MiB of RAM.
 ## Tests
 
 ```sh
-./setup-pdf.sh                                          # once; the PDF tests need it
-/usr/bin/python3 -B -m unittest discover -s tests -v   # regressions (~20 s)
+/usr/bin/python3 -B -m unittest discover -s tests -v   # regressions (~20 s; PDF tests use the installed .pdf-venv)
 TMPDIR=/some/scratch /usr/bin/python3 tests/matrix.py  # every input × every target, outputs decoded for real
 ```
 
