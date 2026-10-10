@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Nautilus script (Ctrl+Alt+C, or sent by the ring when Forward is held): hand the selection to the ring.
+. "$(dirname "$(readlink -f "$0")")/ring-ctl"
+if [ -n "$NAUTILUS_SCRIPT_SELECTED_URIS" ]; then
+    sel="$NAUTILUS_SCRIPT_SELECTED_URIS"
+elif [ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]; then
+    sel="$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+else
+    sel=$(realpath -- "$@" 2>/dev/null)
+fi
+ring_send "files
+$sel"

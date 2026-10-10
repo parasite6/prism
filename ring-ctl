@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Shared by the Nautilus script and ring-start: talk to the resident ring,
+# starting it first if it isn't running (one-time ~0.6 s, after that instant).
+# Private per-user runtime dir only; never a shared /tmp.
+[ -n "$XDG_RUNTIME_DIR" ] || { echo "prism: XDG_RUNTIME_DIR is not set" >&2; return 1 2>/dev/null || exit 1; }
+RUN="$XDG_RUNTIME_DIR/prism"
+RING_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+ring_alive() {
+    # Check the pid is really the ring: a recycled pid would make the FIFO
+    # write below block forever with nobody reading.
+    local pid
+    [ -p "$RUN.fifo" ] && pid=$(cat "$RUN.pid" 2>/dev/null) && [ -n "$pid" ] &&
+        tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q '/ring\.py --daemon $'
+}
+
+ring_start() {
+    (
+        flock -w 3 9 || exit 1  # press + Nautilus script may both cold-start at once
+        ring_alive && exit 0
+        rm -f "$RUN.pid"
+        LD_PRELOAD=/usr/lib64/libgtk4-layer-shell.so.0 setsid -f /usr/bin/python3 "$RING_DIR/ring.py" --daemon >/dev/null 2>&1 </dev/null 9>&-  # the daemon must not inherit (and hold) the lock
+        for _ in $(seq 150); do ring_alive && exit 0; sleep 0.02; done
+        exit 1
+    ) 9>"$RUN.lock"
+}
+
+ring_send() {
+    ring_alive || ring_start || { notify-send -a "Prism" "Prism failed to start"; return 1; }
+    # Bounded: never hang Hyprland's or Nautilus's launcher on a wedged ring.
+    timeout 1 bash -c 'printf "%s\0" "$1" > "$2"' _ "$1" "$RUN.fifo"
+}

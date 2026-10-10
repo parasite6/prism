@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Started by Hyprland at login/reload. The config loads before the compositor
+# has its Wayland socket or has exported WAYLAND_DISPLAY, so ask Hyprland which
+# socket is ours and wait for it; then start the ring if it isn't running.
+. "$(dirname "$(readlink -f "$0")")/ring-ctl"
+for _ in $(seq 100); do
+    if [ -z "$WAYLAND_DISPLAY" ] && [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ]; then
+        sock=$(hyprctl instances -j 2>/dev/null | /usr/bin/python3 -c '
+import json, os, sys
+for i in json.load(sys.stdin):
+    if i.get("instance") == os.environ["HYPRLAND_INSTANCE_SIGNATURE"]:
+        print(i.get("wl_socket", ""))' 2>/dev/null)
+        [ -n "$sock" ] && export WAYLAND_DISPLAY="$sock"
+    fi
+    [ -n "$WAYLAND_DISPLAY" ] && [ -S "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ] && break
+    sleep 0.1
+done
+[ -n "$WAYLAND_DISPLAY" ] || { notify-send -a "Prism" "Prism: no Wayland display found"; exit 1; }
+ring_alive || ring_start
