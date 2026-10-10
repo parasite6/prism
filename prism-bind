@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Choose what opens Prism's ring (default: hold the mouse Forward button).
+exec env -u LD_PRELOAD /usr/bin/python3 "$(dirname "$(readlink -f "$0")")/bind.py" "$@"

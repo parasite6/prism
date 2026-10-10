@@ -17,6 +17,12 @@ sub ring has a BACK petal.
 | **CROP** | One image: opens the crop window |
 | **CLEAN** | Same file, every bit of metadata removed |
 
+To hold something else instead of Forward, open **Prism: Set Shortcut** from
+the app launcher (or run `prism-bind`), press the keys or mouse button, and
+click OK. A binding is modifiers (Ctrl, Shift, Alt, Super) plus one key or
+mouse button, e.g. Ctrl + Alt + A or Shift + Back. It is saved in
+`~/.config/prism/binding.json` and takes effect immediately.
+
 Other ways to open the ring: **Ctrl+Alt+C** in Nautilus, or right-click >
 **Scripts > Prism**. A quick tap leaves the ring open for clicking. Escape,
 Forward again, or releasing outside the ring cancels. Outside Nautilus,
@@ -77,6 +83,19 @@ pixels first, so the picture doesn't change. If there is no scrubber for a type,
 or a file can't be parsed, the conversion fails rather than saving anything
 unscrubbed.
 
+## Untrusted files
+
+Files to convert often come from the internet, so a file can't pull anything
+else in:
+
+- ImageMagick is limited, by `magick/policy.xml`, to the formats Prism handles.
+  A renamed PostScript, MSL or MVG file can't run Ghostscript, read local files
+  or fetch URLs, and no external delegate (Inkscape, LibreOffice...) is started.
+- Documents may embed only images inside their own folder (symlinks resolved),
+  their own media, and `data:` URIs. An image pointing to `~/.ssh/...`, `../..`
+  or a URL is dropped, keeping its alt text, and so is raw HTML or CSS that
+  could load something (`safe-resources.lua`).
+
 Inputs are never modified, except by the crop tool's Replace. Outputs are
 numbered rather than overwriting anything, and a failed conversion leaves
 nothing behind.
@@ -94,8 +113,10 @@ sudo dnf install python3-gobject python3-cairo gtk4 gtk4-layer-shell ImageMagick
 The `ffmpeg` package must be the full build (RPM Fusion, with libx264, libvpx,
 libopus and libmp3lame). A FileChooser portal backend such as
 `xdg-desktop-portal-gnome` or `-gtk` is needed for the crop tool's Save. Reading
-the Forward button needs read access to `/dev/input` (for example the `input`
-group); without it only Ctrl+Alt+C works. `exiftool` is optional; it lets CLEAN
+the Forward button (or your binding) needs read access to `/dev/input` (for
+example the `input` group); without it only Ctrl+Alt+C works. The daemon asks
+the kernel for the binding's keys only, so typing and mouse movement never
+reach it. `exiftool` is optional; it lets CLEAN
 strip AVIF and HEIC losslessly.
 
 Copy the folder somewhere permanent, then run:
@@ -109,6 +130,7 @@ cp -r prism ~/.local/share/prism
 `install.sh` does the following:
 
 - links the Nautilus script and adds the Ctrl+Alt+C accelerator;
+- adds **Prism: Set Shortcut** to the app launcher;
 - adds a `dofile` of `hypr-binds.lua` to `~/.config/hypr/custom.lua`, which
   starts the ring with the session, blurs the ring's layer, and stops Forward
   from also navigating in Nautilus;

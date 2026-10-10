@@ -20,6 +20,19 @@ touch "$CONFIG_DIR/scripts-accels"
 sed -i '/^<Control><Alt>c Convert$/d' "$CONFIG_DIR/scripts-accels"
 grep -Fqx '<Control><Alt>c Prism' "$CONFIG_DIR/scripts-accels" || echo '<Control><Alt>c Prism' >> "$CONFIG_DIR/scripts-accels"
 nautilus -q 2>/dev/null || true  # restarts on next open
+# "Prism: Set Shortcut" in the app launcher (also: prism-bind).
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$APPS"
+cat > "$APPS/dev.prism.Bind.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Prism: Set Shortcut
+Comment=Choose the key or mouse button you hold to open Prism's ring
+Exec="$DIR/prism-bind"
+Icon=input-mouse
+Terminal=false
+Categories=Settings;Utility;
+DESKTOP
 echo "Installed. In Nautilus: select files, press Ctrl+Alt+C (or right-click > Scripts > Prism)."
 
 # Hold Forward to open the ring, via Hyprland's custom.lua hook.

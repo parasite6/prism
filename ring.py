@@ -46,6 +46,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Gtk4LayerShell as LayerShell  # n
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import binding  # noqa: E402
 import convert  # noqa: E402
 
 if not os.environ.get("XDG_RUNTIME_DIR"):
@@ -138,42 +139,55 @@ EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit Linux
 
 
 class ButtonWatch:
-    """Reads Forward-button presses straight from the mouse (read-only, never
-    grabbed, so apps still get the button). Hyprland's release bindings for mouse
-    buttons were unreliable: sometimes no release, sometimes six."""
+    """Reads the binding (Forward by default; see binding.py) straight from the
+    mouse and keyboard: read-only, never grabbed, so apps still get the input.
+    Hyprland's release bindings for mouse buttons were unreliable: sometimes no
+    release, sometimes six."""
 
-    def __init__(self, on_change):
+    def __init__(self, on_change, bound=None):
         self.on_change = on_change
         self.devices = {}  # path -> (fd, watch id)
+        self.held = {}  # path -> modifier codes down on that device
         self.down = False
+        self.set_binding(bound or binding.load(), rescan=False)
         self.rescan()
         # New/removed input devices (replugging the mouse): inotify, no polling.
         self.monitor = Gio.File.new_for_path("/dev/input").monitor_directory(Gio.FileMonitorFlags.NONE, None)
         self.monitor.connect("changed", lambda *_: GLib.timeout_add(500, self.rescan))
 
-    @staticmethod
-    def has_forward(event):
+    def set_binding(self, bound, rescan=True):
+        """Watch a new binding: the trigger key/button and its modifiers' codes."""
+        for path in list(self.devices):
+            self.drop(path)
+        self.trigger = bound["code"]
+        self.mods = [binding.MODS[m] for m in bound["mods"]]
+        self.codes = {self.trigger, *(c for pair in self.mods for c in pair)}
+        debug(f"binding: {binding.describe(bound)}")
+        if rescan:
+            self.rescan()
+
+    def has_codes(self, event):
         try:
             words = open(f"/sys/class/input/{event}/device/capabilities/key").read().split()
         except OSError:
             return False
         bits = int("".join(w.rjust(16, "0") for w in words), 16) if words else 0
-        return bool(bits >> BTN_EXTRA & 1)
+        return any(bits >> code & 1 for code in self.codes)
 
     def rescan(self):
         for path in [p for p in self.devices if not os.path.exists(p)]:
             self.drop(path)
         for event in os.listdir("/sys/class/input"):
             path = f"/dev/input/{event}"
-            if event.startswith("event") and path not in self.devices and self.has_forward(event):
+            if event.startswith("event") and path not in self.devices and self.has_codes(event):
                 try:
                     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                 except OSError:
                     continue  # not readable: the Ctrl+Alt+C shortcut still works
                 try:
-                    self.mask_to_forward(fd)
+                    self.mask_to(fd, self.codes)
                 except OSError:
-                    os.close(fd)  # without the mask every mouse move would wake us
+                    os.close(fd)  # without the mask every mouse move (or keypress) would wake us
                     continue
                 watch = GLib.io_add_watch(fd, GLib.PRIORITY_HIGH, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP,
                                           self.read, path)
@@ -182,12 +196,13 @@ class ButtonWatch:
         return GLib.SOURCE_REMOVE
 
     @staticmethod
-    def mask_to_forward(fd, code=BTN_EXTRA):
-        """EVIOCSMASK: have the kernel deliver only Forward-button events to this
-        fd, so mouse movement (~250 events/s) never wakes the daemon."""
+    def mask_to(fd, codes=(BTN_EXTRA,)):
+        """EVIOCSMASK: have the kernel deliver only the binding's key events to
+        this fd, so mouse movement (~250 events/s) and typing never wake the daemon."""
         eviocsmask = (1 << 30) | (16 << 16) | (ord("E") << 8) | 0x93
         keys = ctypes.create_string_buffer(0x300 // 8)  # KEY_CNT bits, all off
-        keys[code // 8] = 1 << (code % 8)
+        for code in codes:
+            keys[code // 8] = keys[code // 8][0] | 1 << (code % 8)
         empty = ctypes.create_string_buffer(8)
         # EV_SYN is left unmasked: the kernel wakes readers on SYN_REPORT and
         # drops reports the mask left empty, so motion still never wakes us.
@@ -197,6 +212,7 @@ class ButtonWatch:
             fcntl.ioctl(fd, eviocsmask, struct.pack("IIQ", ev_type, size, ctypes.addressof(buf)))
 
     def drop(self, path):
+        self.held.pop(path, None)
         fd, watch = self.devices.pop(path)
         GLib.source_remove(watch)
         os.close(fd)
@@ -218,10 +234,22 @@ class ButtonWatch:
             return False
         for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
             _, _, kind, code, value = EVENT.unpack_from(data, i)
-            if kind == EV_KEY and code == BTN_EXTRA and value in (0, 1) and bool(value) != self.down:
-                self.down = bool(value)
-                self.on_change(self.down)
+            if kind != EV_KEY or value not in (0, 1):  # 2 is key repeat
+                continue
+            if code != self.trigger:  # a modifier
+                held = self.held.setdefault(path, set())
+                (held.add if value else held.discard)(code)
+            elif value and not self.down and self.mods_held():
+                self.down = True
+                self.on_change(True)
+            elif not value and self.down:  # released: the trigger alone decides
+                self.down = False
+                self.on_change(False)
         return True
+
+    def mods_held(self):
+        held = set().union(*self.held.values())
+        return all(left in held or right in held for left, right in self.mods)
 
 
 def rounded_rect(cr, x, y, w, h, r):
@@ -940,6 +968,8 @@ class App(Gtk.Application):
                 self.window.set_files(parse_selection(payload))
             elif command == "release":
                 self.window.release()
+            elif command == "rebind":  # bind.py saved a new binding
+                self.buttons.set_binding(binding.load())
         return True
 
     def start(self, files, ext):

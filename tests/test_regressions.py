@@ -731,6 +731,83 @@ class HostileInputTests(unittest.TestCase):
             convert.convert(str(src), "jpg")
 
 
+class BindingTests(unittest.TestCase):
+    """binding.py (what opens the ring) and ButtonWatch's hold/release logic."""
+    def setUp(self):
+        import binding
+        self.binding = binding
+        self.tmp = tempfile.TemporaryDirectory(prefix="prism-bind-")
+        self.env = patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_default_is_forward_and_round_trips(self):
+        b = self.binding
+        self.assertEqual(b.load(), b.DEFAULT)
+        self.assertEqual(b.hypr(b.DEFAULT), "mouse:276")
+        chosen = b.make(["ALT", "CTRL"], 30, "A")
+        self.assertEqual(chosen["mods"], ["CTRL", "ALT"])  # canonical order
+        self.assertEqual(b.hypr(chosen), "CTRL + ALT + code:38")
+        self.assertEqual(b.describe(chosen), "Ctrl + Alt + A")
+        b.save(chosen)
+        self.assertEqual(b.load(), chosen)
+        self.assertIn('"hypr": "CTRL + ALT + code:38"', b.path().read_text())  # what hypr-binds.lua reads
+        self.assertEqual(b.hypr(b.make(["SHIFT"], 275, "Back")), "SHIFT + mouse:275")
+
+    def test_refuses_unusable_bindings(self):
+        b = self.binding
+        for mods, code in ((["CTRL"], 29), ([], 272), (["CTRL", "ALT"], 46), ([], 0)):
+            with self.assertRaises(ValueError):
+                b.make(mods, code, "x")
+
+    def test_broken_file_falls_back_to_forward(self):
+        b = self.binding
+        b.path().parent.mkdir(parents=True)
+        for text in ("{not json", '{"mods": ["CTRL"], "code": 29, "label": "Ctrl"}', '{"code": "x"}'):
+            b.path().write_text(text)
+            self.assertEqual(b.load(), b.DEFAULT)
+
+    def watch(self, bound):
+        import struct as st
+        glib = type("GLib", (), {"IO_ERR": 8, "IO_HUP": 16})
+        namespace = ring_nodes({"binding": self.binding, "debug": lambda m: None, "os": os, "GLib": glib,
+                                "Gio": None, "EV_KEY": 1, "EVENT": st.Struct("llHHi"), "BTN_EXTRA": 276},
+                               "guarded", "ButtonWatch")
+        Watch = namespace["ButtonWatch"]
+        w = Watch.__new__(Watch)
+        w.on_change, w.devices, w.held, w.down = [].append, {}, {}, False
+        w.changes = []
+        w.on_change = w.changes.append
+        w.set_binding(bound, rescan=False)
+        w.EVENT = namespace["EVENT"]
+        return w
+
+    def feed(self, w, path, *events):
+        data = b"".join(w.EVENT.pack(0, 0, 1, code, value) for code, value in events)
+        with patch("os.read", lambda fd, n: data):
+            w.read(0, 0, path)
+
+    def test_modifiers_on_keyboard_trigger_on_mouse(self):
+        w = self.watch(self.binding.make(["CTRL"], 276, "Forward"))
+        self.feed(w, "mouse", (276, 1), (276, 0))  # Forward alone: not the binding
+        self.assertEqual(w.changes, [])
+        self.feed(w, "kbd", (97, 1))  # right Ctrl counts as Ctrl
+        self.feed(w, "mouse", (276, 1))
+        self.feed(w, "kbd", (97, 0))  # letting go of Ctrl first doesn't end the hold
+        self.assertEqual(w.changes, [True])
+        self.feed(w, "mouse", (276, 0))
+        self.assertEqual(w.changes, [True, False])
+
+    def test_key_binding_ignores_repeat(self):
+        w = self.watch(self.binding.make(["CTRL", "ALT"], 30, "A"))
+        self.feed(w, "kbd", (29, 1), (56, 1), (30, 1), (30, 2), (30, 2), (30, 0))
+        self.assertEqual(w.changes, [True, False])
+        self.assertEqual(w.codes, {30, 29, 97, 56, 100})  # what the kernel mask lets through
+
+
 class InstallerTests(unittest.TestCase):
     def test_installer_uses_xdg_data_directory(self):
         with tempfile.TemporaryDirectory() as d:
@@ -748,6 +825,8 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(launcher.is_symlink())
             self.assertEqual(launcher.resolve(), ROOT / "prism")
             self.assertTrue((folder / "config/nautilus/scripts-accels").is_file())
+            desktop = (folder / "data/applications/dev.prism.Bind.desktop").read_text()
+            self.assertIn(f'Exec="{ROOT}/prism-bind"', desktop)
 
 
     def test_installer_takes_over_from_the_old_name(self):
