@@ -1114,4 +1114,8 @@ def daemon():
 if __name__ == "__main__":
     if sys.argv[1:] != ["--daemon"]:
         sys.exit("Run via ring-ctl / the Nautilus script; `ring.py --daemon` starts the resident ring.")
+    # Hyprland runs with SIGTERM blocked and children inherit the mask: started
+    # at login, the ring never saw install.sh's or logout's SIGTERM. Unblock
+    # before any thread starts, so every thread inherits the fixed mask.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
     daemon()
