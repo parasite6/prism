@@ -318,6 +318,7 @@ class RingGeometryTests(unittest.TestCase):
                      **look}
         cls.Logic = ring_nodes(namespace, "guarded", "Ring", "mix", "centred_text", "pill", "paint_cover",
                                "rounded_rect", "short_name", prefix="ease_")["Ring"]
+        cls.look = look
 
     def logic(self):
         obj = self.Logic.__new__(self.Logic)
@@ -359,6 +360,42 @@ class RingGeometryTests(unittest.TestCase):
             self.assertGreaterEqual(y, 0)
             self.assertLessEqual(x, 200)
             self.assertLessEqual(y, 160)
+
+    def test_long_name_pill_never_covers_a_petal_label(self):
+        import cairo
+        # The main ring and the densest sub ring (a doc's eight convert targets).
+        shapes = [["convert", "compress", "rescale", "edit", "clean"],
+                  ["back", "pdf", "docx", "odt", "md", "html", "txt", "png"]]
+        long_name = "a-very-long-descriptive-file-name-that-goes-on.pdf"
+
+        def draw(targets, name):
+            obj = self.logic()
+            obj.targets, obj.pop = targets, [0.] * len(targets)
+            obj.name_text = name
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 520, 520)
+            cr = cairo.Context(surface)
+            obj.draw(None, cr, 520, 520)
+            obj.draw_ghost(cr, obj.cx, obj.cy)  # the drag ghost, above the ring
+            surface.flush()
+            return obj, surface, bytes(surface.get_data())
+
+        measure = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+        for targets in shapes:
+            ref_obj, ref_surface, ref = draw(targets, "sample.png")
+            _, _, got = draw(targets, long_name)
+            stride = ref_surface.get_stride()
+            for i, target in enumerate(targets):
+                lx, ly = ref_obj.slice_center(i, (self.look["R_IN"] + self.look["R_OUT"]) / 2, drawing=True)
+                text = convert.label(target)
+                measure.select_font_face(self.look["FONT"], 0, 1)
+                measure.set_font_size(15)
+                e = measure.text_extents(text)
+                x0, y0 = int(lx - e.x_advance / 2), int(ly - e.height / 2)
+                boxes = [(x, y) for y in range(y0, y0 + int(e.height) + 1)
+                         for x in range(x0, x0 + int(e.x_advance) + 1)]
+                covered = sum(ref[y * stride + x * 4:y * stride + x * 4 + 4]
+                              != got[y * stride + x * 4:y * stride + x * 4 + 4] for x, y in boxes)
+                self.assertEqual(covered, 0, f"{text} is covered by the file name pill")
 
 
 class RingMenuTests(unittest.TestCase):

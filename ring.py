@@ -72,6 +72,7 @@ GROW = 12  # how far the hovered petal grows outward
 PETAL_GAP = 0.075  # radians trimmed from each side of a petal
 PETAL_ROUND = 14  # corner diameter
 GHOST = 64  # thumbnail size
+NAME_W = 96  # widest the file name pill may get over the ring: past this it reaches the petal labels
 FONT = "Adwaita Sans"  # Inter-based; Inter itself is not installed here
 GHOST_W, GHOST_H = 300, GHOST + 60
 GHOST_TOP = GHOST / 2 + 14  # the ghost's centre, from the top of its layer
@@ -275,9 +276,20 @@ def centred_text(cr, text, x, y, size, rgba, bold=False):
     return e
 
 
-def pill(cr, x, y, text, bg, bg_alpha, fg, alpha, size=11):
+def pill(cr, x, y, text, bg, bg_alpha, fg, alpha, size=11, max_w=None):
     cr.select_font_face(FONT, 0, 0)
     cr.set_font_size(size)
+    if max_w:  # a long name must not spill over the petals' labels
+        room, full = max_w - 16, text.replace("\u2026", "")
+        text = full
+        if cr.text_extents(text).x_advance > room:
+            for keep in range(len(full) - 1, 0, -1):
+                head = (keep + 1) // 2
+                text = full[:head] + "\u2026" + full[len(full) - (keep - head):]
+                if cr.text_extents(text).x_advance <= room:
+                    break
+            else:
+                text = "\u2026"
     w, h = cr.text_extents(text).x_advance + 16, size + 9
     rounded_rect(cr, x - w / 2, y - h / 2, w, h, h / 2 - 2)
     cr.set_source_rgba(*bg, bg_alpha * alpha)
@@ -867,7 +879,7 @@ class Ring(Gtk.ApplicationWindow):
                              16, (*INK, ha), bold=True)
             if self.size_text:
                 pill(cr, self.cx, self.cy + (0 if self.thumb else 10), self.size_text, (1, 1, 1), 0.85, INK, ha)
-            pill(cr, self.cx, self.cy + hub + 12, self.name_text, PILL, 1.0, (1, 1, 1), ha)
+            pill(cr, self.cx, self.cy + hub + 12, self.name_text, PILL, 1.0, (1, 1, 1), ha, max_w=NAME_W)
         cr.restore()
 
     def draw_ghost(self, cr, gx, gy):
@@ -889,7 +901,7 @@ class Ring(Gtk.ApplicationWindow):
             label = convert.ext_of(self.files[0]).upper()[:4] or "FILE"
             centred_text(cr, label, gx, gy, 14 * s / GHOST, (*INK, ga), bold=True)
         if self.phase != "drop":
-            pill(cr, gx, y + s + 14, self.name_text, PILL, 1.0, (1, 1, 1), ga)
+            pill(cr, gx, y + s + 14, self.name_text, PILL, 1.0, (1, 1, 1), ga, max_w=NAME_W)
 
 
 class App(Gtk.Application):
