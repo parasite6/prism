@@ -925,8 +925,7 @@ def _cutout(src, payload, work):
             out = None  # flat edges but no clean cut (e.g. the subject touches them): the model
     if out is None:
         if not matting.available():
-            raise RuntimeError("This picture needs the GPU model (BiRefNet_HR-matting), which isn't set up: "
-                               "see the README; nothing was saved")
+            raise RuntimeError(matting.unavailable_reason())
         if matting._model is None:
             _progress("Loading the model", 0.0, "load")
             matting.precheck()  # RAM and VRAM, via nvidia-smi: before spending ~4 s importing torch
@@ -1245,7 +1244,9 @@ def cutout_isolated(files):
     the work goes: a Progress while a file is worked on, then its ConversionResult
     or RuntimeError. (None, Progress) is batch-wide (releasing the GPU)."""
     env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")}
-    worker = ["/usr/bin/python3", str(BASE / "convert.py"), "--cutout-batch", *map(str, files)]
+    import matting  # light: no torch import here
+    # The interpreter with PyTorch: the system one, or setup-model.py's .model-venv.
+    worker = [matting.python(), str(BASE / "convert.py"), "--cutout-batch", *map(str, files)]
     if shutil.which("systemd-run") and env.get("DBUS_SESSION_BUS_ADDRESS"):
         worker = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                   "-p", f"MemoryMax={_cutout_memory()}", "-p", "MemorySwapMax=0", "--", *worker]

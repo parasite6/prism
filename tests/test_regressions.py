@@ -1054,7 +1054,7 @@ class InstallerTests(unittest.TestCase):
                 fake = bin_dir / name
                 fake.write_text("#!/bin/sh\nexit 0\n"); fake.chmod(0o755)
             runtime = folder / "run"; runtime.mkdir()
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1", PRISM_SKIP_MODEL="1", PRISM_SKIP_DEPS="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
             run(["bash", str(ROOT / "install-nautilus.sh")], env=env)
             launcher = folder / "data/nautilus/scripts/Prism"
@@ -1077,7 +1077,7 @@ class InstallerTests(unittest.TestCase):
                 fake = bin_dir / name
                 fake.write_text(f"#!/bin/sh\nexit {code}\n"); fake.chmod(0o755)
             runtime = folder / "run"; runtime.mkdir()
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1", PRISM_SKIP_MODEL="1", PRISM_SKIP_DEPS="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
             menus = folder / "data/kio/servicemenus"; menus.mkdir(parents=True)
             (menus / "dev.prism.menu-stale.desktop").write_text("x")  # a target since removed
@@ -1115,7 +1115,7 @@ class InstallerTests(unittest.TestCase):
             accels.write_text("<Control><Alt>c Convert\n<Control>F5 Mine\n")
             custom = folder / ".config/hypr/custom.lua"; custom.parent.mkdir(parents=True)
             custom.write_text('hl.config({})\ndofile("/home/x/.local/share/convert-ring/hypr-binds.lua")\n')
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1", PRISM_SKIP_MODEL="1", PRISM_SKIP_DEPS="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
             installed = folder / "data/prism"
             (installed / ".pdf-venv").mkdir(parents=True)
@@ -1137,13 +1137,52 @@ class InstallerTests(unittest.TestCase):
             folder = Path(d)
             target = folder / "data/prism"; target.mkdir(parents=True)
             (target / "notes.txt").write_text("someone else's")
-            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), PRISM_SKIP_PDF="1",
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), PRISM_SKIP_PDF="1", PRISM_SKIP_MODEL="1", PRISM_SKIP_DEPS="1",
                        XDG_RUNTIME_DIR=d, XDG_CONFIG_HOME=str(folder / "config"))
             for installer in ("install-nautilus.sh", "install-dolphin.sh"):
                 result = subprocess.run(["bash", str(ROOT / installer)], env=env, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("isn't a Prism install", result.stderr)
                 self.assertEqual([p.name for p in target.iterdir()], ["notes.txt"])
+
+
+    def test_missing_dependencies_are_listed_in_one_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            bin_dir = Path(d)
+            for tool in ("tr", "sort"):  # all the check itself uses
+                (bin_dir / tool).symlink_to(shutil.which(tool))
+            for fm, has, lacks in (("dolphin", "dolphin", "nautilus"), ("nautilus", "nautilus", "dolphin")):
+                result = subprocess.run(["/bin/bash", "-c", f'. "{ROOT}/install-common.sh"; prism_deps {fm}'],
+                                        env={"PATH": str(bin_dir), "HOME": d}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1)
+                line = result.stderr.splitlines()[-1].split()
+                self.assertEqual(line[:3], ["sudo", "dnf", "install"])
+                self.assertIn(has, line)
+                self.assertNotIn(lacks, line)
+                self.assertIn("rsync", line)
+                self.assertEqual(len(line), len(set(line)))  # each package once
+
+    def test_old_one_line_installer_still_works(self):
+        """Prism 0.1's release installer runs install.sh: it runs the Nautilus
+        installer, and the Dolphin one too when Dolphin's menus were there."""
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            bin_dir = folder / "bin"; bin_dir.mkdir()
+            for name, code in (("nautilus", 0), ("hyprctl", 0), ("pgrep", 1)):
+                fake = bin_dir / name
+                fake.write_text(f"#!/bin/sh\nexit {code}\n"); fake.chmod(0o755)
+            runtime = folder / "run"; runtime.mkdir()
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
+                       PRISM_SKIP_MODEL="1", PRISM_SKIP_DEPS="1", XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
+            self.assertTrue(os.access(ROOT / "install.sh", os.X_OK))  # the old installer checks -x
+            run(["bash", str(ROOT / "install.sh")], env=env)
+            self.assertTrue((folder / "data/nautilus/scripts/Prism").is_symlink())
+            menus = folder / "data/kio/servicemenus"
+            self.assertFalse(menus.exists())  # had no Dolphin menus: still none
+            menus.mkdir(parents=True)
+            (menus / "dev.prism.menu-clean.desktop").write_text("x")  # an install from before the split
+            run(["bash", str(ROOT / "install.sh")], env=env)
+            self.assertIn("dev.prism.menu-nobg.desktop", [p.name for p in menus.iterdir()])
 
 
 class DolphinMenuTests(unittest.TestCase):
@@ -1453,6 +1492,123 @@ class MattingSafetyTests(unittest.TestCase):
             model.spare = lambda: (80 + 2 * self.m.BAND_MARGIN) * w * self.m.FUSION_PER_PX
             banded = model._foreground(image, alpha)
         self.assertTrue(np.array_equal(one, banded))
+
+
+
+def _setup_model():
+    spec = importlib.util.spec_from_file_location("setup_model", ROOT / "setup-model.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class ModelSetupTests(unittest.TestCase):
+    """setup-model.py: the installers' GPU check and download, never the real network."""
+
+    def fake_machine(self, mod, query=None, header="", lspci="", ram_gb=32):
+        def run(cmd, **_kw):
+            out = {"--query-gpu": query, "nvidia-smi": header, "lspci": lspci}
+            key = next((k for k in ("--query-gpu",) if any(k in c for c in cmd)), cmd[0])
+            text = out.get(key)
+            if text is None:
+                return None
+            return subprocess.CompletedProcess(cmd, 0, text, "")
+        return patch.multiple(mod, _run=run, ram_total=lambda: ram_gb << 30)
+
+    def verdict(self, **machine):
+        mod = _setup_model()
+        with self.fake_machine(mod, **machine):
+            return mod.assess()
+
+    def test_a_good_gpu_gets_the_build_for_its_driver(self):
+        ok, reason, index = self.verdict(query="NVIDIA GeForce RTX 4060 Laptop GPU, 8188, 8.9\n",
+                                         header="| NVIDIA-SMI 615.78.08   KMD Version: 615.78.08   CUDA UMD Version: 13.4 |")
+        self.assertTrue(ok, reason)
+        self.assertEqual(index, "cu130")
+        ok, _, index = self.verdict(query="NVIDIA GeForce RTX 3080, 10240, 8.6\n",
+                                    header="| NVIDIA-SMI 550.54   Driver Version: 550.54   CUDA Version: 12.6 |")
+        self.assertEqual((ok, index), (True, "cu126"))
+
+    def test_4_gb_of_vram_is_refused_with_the_reason(self):
+        ok, reason, _ = self.verdict(query="NVIDIA GeForce GTX 1650, 4096, 7.5\n", header="CUDA Version: 12.8")
+        self.assertFalse(ok)
+        self.assertIn("8 GB of video memory", reason)
+        self.assertIn("GTX 1650 has 4 GB", reason)
+
+    def test_an_old_gpu_is_refused(self):
+        ok, reason, _ = self.verdict(query="NVIDIA GeForce GTX 1080, 8192, 6.1\n", header="CUDA Version: 12.8")
+        self.assertFalse(ok)
+        self.assertIn("RTX 20 series", reason)
+
+    def test_no_nvidia_gpu_names_what_there_is(self):
+        ok, reason, _ = self.verdict(lspci="03:00.0 VGA compatible controller: AMD Radeon RX 7800 XT\n")
+        self.assertFalse(ok)
+        self.assertIn("needs an NVIDIA GPU", reason)
+        self.assertIn("Radeon RX 7800 XT", reason)
+
+    def test_an_old_driver_is_refused(self):
+        ok, reason, _ = self.verdict(query="NVIDIA GeForce RTX 3080, 10240, 8.6\n", header="CUDA Version: 12.2")
+        self.assertFalse(ok)
+        self.assertIn("newer NVIDIA driver", reason)
+        # Blackwell needs the 12.8 build at least.
+        ok, _, _ = self.verdict(query="NVIDIA GeForce RTX 5070, 12227, 12.0\n", header="CUDA Version: 12.6")
+        self.assertFalse(ok)
+
+    def test_too_little_ram_is_refused(self):
+        ok, reason, _ = self.verdict(query="NVIDIA GeForce RTX 4060, 8188, 8.9\n", header="CUDA Version: 13.0", ram_gb=8)
+        self.assertFalse(ok)
+        self.assertIn("12 GB of RAM", reason)
+
+    def test_the_largest_gpu_is_judged(self):
+        ok, reason, _ = self.verdict(query="NVIDIA T400, 2048, 7.5\nNVIDIA GeForce RTX 4090, 24564, 8.9\n",
+                                     header="CUDA Version: 13.0")
+        self.assertTrue(ok)
+        self.assertIn("4090", reason)
+
+    def test_a_refusal_is_saved_and_shown_by_prism(self):
+        import matting
+        mod = _setup_model()
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(mod, "STATUS", Path(d) / "status.json"), patch.object(matting, "STATUS", Path(d) / "status.json"), \
+                self.fake_machine(mod, query="NVIDIA GeForce GTX 1650, 4096, 7.5\n", header="CUDA Version: 12.8"), \
+                patch.dict(os.environ, {"PRISM_SKIP_MODEL": ""}), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mod.main(), 0)  # never fails the install
+            self.assertIn("still works on flat graphics", out.getvalue())
+            self.assertIn("GTX 1650 has 4 GB", matting.unavailable_reason())
+            self.assertEqual(matting.python(), "/usr/bin/python3")
+
+    def test_prism_uses_the_interpreter_the_installer_chose(self):
+        import matting
+        with tempfile.TemporaryDirectory() as d:
+            status, weights = Path(d) / "status.json", Path(d) / "model.safetensors"
+            weights.write_bytes(b"x")
+            py = Path(d) / "python"; py.write_text("#!/bin/sh\n"); py.chmod(0o755)
+            status.write_text(json.dumps({"ok": True, "reason": "", "python": str(py)}))
+            with patch.object(matting, "STATUS", status), patch.object(matting, "WEIGHTS", weights):
+                self.assertEqual(matting.python(), str(py))
+                self.assertTrue(matting.available())
+                status.write_text(json.dumps({"ok": True, "python": "/nonexistent/python"}))
+                self.assertEqual(matting.python(), "/usr/bin/python3")  # gone: back to the system one
+
+    def test_weights_download_is_verified(self):
+        import matting
+        mod = _setup_model()
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "served.bin"; src.write_bytes(b"weights" * 1000)
+            dest = Path(d) / "models/model.safetensors"
+            good = hashlib.sha256(src.read_bytes()).hexdigest()
+            with patch.object(mod, "URL", src.as_uri()), patch.object(matting, "WEIGHTS", dest), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(matting, "SHA256", "0" * 64):
+                    with self.assertRaises(RuntimeError):
+                        mod.fetch_weights()
+                    self.assertFalse(dest.exists())  # a bad download leaves nothing behind
+                    self.assertEqual(list(dest.parent.iterdir()), [])
+                with patch.object(matting, "SHA256", good):
+                    mod.fetch_weights()
+                    self.assertEqual(dest.read_bytes(), src.read_bytes())
+                    src.unlink()
+                    mod.fetch_weights()  # already in place: not fetched again
 
 
 if __name__ == "__main__":

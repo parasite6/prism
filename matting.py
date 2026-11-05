@@ -25,6 +25,7 @@ The budgets below are peaks measured on this model, with margin added.
 import fcntl
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -34,6 +35,7 @@ import numpy as np
 
 DATA = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
 WEIGHTS = DATA / "prism-models" / "ZhengPeng7" / "model.safetensors"
+STATUS = DATA / "prism-models" / "status.json"  # written by setup-model.py
 SHA256 = "a5a4de698739ea5e0e8bbab28e1b293dde95092b87a442d566cbc585c53cef55"  # BiRefNet_HR-matting
 SIZE = 2048  # the HR model's training resolution
 MEAN, STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
@@ -68,9 +70,40 @@ def _quiet(*_args):
     pass
 
 
+def _status():
+    """What setup-model.py (run by the installers) found: ok, reason, python."""
+    try:
+        s = json.loads(STATUS.read_text())
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def python():
+    """The interpreter that has PyTorch with CUDA: setup-model.py's choice (its
+    own .model-venv when the system had none), else the system one."""
+    s = _status()
+    py = s.get("python")
+    return py if s.get("ok") and isinstance(py, str) and os.access(py, os.X_OK) else "/usr/bin/python3"
+
+
 def available():
     """Cheap check for the menus: no torch import (that alone takes seconds)."""
-    return WEIGHTS.is_file() and all(importlib.util.find_spec(m) for m in NEEDS)
+    if not WEIGHTS.is_file():
+        return False
+    if python() != "/usr/bin/python3":
+        return True  # setup-model.py checked that interpreter runs the model on this GPU
+    return all(importlib.util.find_spec(m) for m in NEEDS)
+
+
+def unavailable_reason():
+    """Why the model can't run here, for the refusal: the installer's verdict
+    when it made one (no NVIDIA GPU, too little VRAM...)."""
+    s = _status()
+    if s and not s.get("ok") and s.get("reason"):
+        return f"{s['reason']}; nothing was saved"
+    return ("This picture needs the GPU model (BiRefNet_HR-matting), which isn't set up: "
+            "run install-nautilus.sh or install-dolphin.sh; nothing was saved")
 
 
 def _gb(n):
@@ -113,7 +146,7 @@ def precheck():
     """Before the batch worker starts (in the caller, cheaply): enough RAM for
     torch and enough VRAM for the model, or a clear refusal."""
     if not available():
-        raise RuntimeError(f"Remove background needs the model weights at {WEIGHTS}; nothing was saved")
+        raise RuntimeError(unavailable_reason())
     _need_ram(RAM_BASE)
     free = gpu_free_quick()
     if free is None:
@@ -160,7 +193,7 @@ class Model:
     def __init__(self, progress=_quiet):
         """progress(fraction 0..1) as loading goes."""
         if not WEIGHTS.is_file():
-            raise RuntimeError(f"Remove background needs the model weights at {WEIGHTS}; nothing was saved")
+            raise RuntimeError(unavailable_reason())
         progress(0.0)
         _verify()
         progress(0.05)

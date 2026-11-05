@@ -42,9 +42,8 @@ REMOVE BG has two methods and picks one for each image:
   (MIT) on an NVIDIA GPU, at its full 2048 × 2048 resolution. It gives a true
   alpha matte, so hair, fur and glass stay partly transparent. Edge colours are
   then cleaned with the model's own refinement step (blur-fusion). The network
-  code is in `birefnet/`. The weights aren't included: put `model.safetensors`
-  from that page in `~/.local/share/prism-models/ZhengPeng7/`, and Prism checks
-  its SHA-256 before using it.
+  code is in `birefnet/`; the installers download the weights (see
+  [Install](#install)).
 
 On an RTX 4060 Laptop GPU, the first photo takes ~7.5 s, and each further photo
 in the same selection ~2.5 s (a batch loads the model once).
@@ -59,8 +58,9 @@ The worker is also hard-capped (6 GB RAM in a systemd scope, VRAM capped to what
 was checked) and runs at background priority. Batches take turns on the GPU.
 Edge refinement runs in bands sized to the VRAM free at that moment, so big
 photos fit; banded output is identical to a single pass. Images over ~65 MP are
-refused. With no GPU or no weights, a photo gets a notification instead of a
-worse result.
+refused. When the machine can't run the model, a photo gets a notification
+saying why (the installer's verdict, e.g. too little VRAM) instead of a worse
+result.
 
 To hold something else instead of Forward, open **Prism: Set Shortcut** from
 the app launcher (or run `prism-bind`), press the keys or mouse button, and
@@ -182,18 +182,43 @@ sudo dnf install python3-gobject python3-cairo gtk4 gtk4-layer-shell ImageMagick
     libnotify perl-Image-ExifTool bubblewrap python3-numpy python3-scipy python3-pillow
 ```
 
-For REMOVE BG on photos, also: the NVIDIA driver, plus PyTorch with CUDA,
-torchvision, kornia, einops and safetensors (`pip install --user torch
-torchvision kornia einops safetensors`), and the weights described above.
-Without them, flat graphics still work.
+REMOVE BG on photos also needs the NVIDIA driver. Both installers set up the rest
+with `setup-model.py`. It first checks the machine and stops with the reason if
+it can't run the model:
+
+- an NVIDIA GPU, RTX 20 series (Turing) or newer, with 8 GB of video memory
+  (4 GB cards and AMD or Intel GPUs are refused);
+- a driver supporting CUDA 12.6 or later (12.8 for RTX 50 cards);
+- 12 GB of RAM.
+
+Then, asking first on a terminal:
+
+- **PyTorch**: a working one in `/usr/bin/python3` (torch with CUDA,
+  torchvision, kornia, einops, safetensors) is used as it is. Otherwise the
+  build matching the driver's CUDA version (cu130, cu128 or cu126) goes into
+  `.model-venv` in the install folder, about 3 GB.
+- **The weights**: `model.safetensors` (444 MB) from the model's Hugging Face
+  page into `~/.local/share/prism-models/ZhengPeng7/`, checked against its
+  SHA-256.
+
+The verdict is kept in `~/.local/share/prism-models/status.json`. Run
+`setup-model.py --check` to see it without installing anything, and set
+`PRISM_SKIP_MODEL=1` to skip the step. Without the model, flat graphics still work.
 
 The `ffmpeg` package must be the full build (RPM Fusion, with libx264, libvpx,
 libopus and libmp3lame). A FileChooser portal backend such as
 `xdg-desktop-portal-gnome` or `-gtk` is needed for the edit window's Save.
 `exiftool` is optional; it lets CLEAN strip AVIF and HEIC losslessly.
 
-Then clone the repo and run the installer for your file manager. You can run
-both if you use both.
+Then run the installer for your file manager, as yourself (not root). You can
+run both if you use both. Each one fetches Prism on its own:
+
+```sh
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-nautilus.sh | bash   # the ring
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-dolphin.sh | bash    # right-click menus
+```
+
+Or from a clone:
 
 ```sh
 git clone https://github.com/parasite6/prism && cd prism
@@ -201,12 +226,22 @@ git clone https://github.com/parasite6/prism && cd prism
 ./install-dolphin.sh    # Dolphin: right-click menus
 ```
 
-Re-run the same installer after pulling an update. Both first:
+Re-run the same installer to update. Run on its own, an installer clones Prism
+into a temporary folder (removed afterwards) and runs from there; `PRISM_REF`
+picks a tag or branch. `install.sh` remains for Prism 0.1's one-line installer:
+it runs the Nautilus installer, plus the Dolphin one if Dolphin's menus are
+already installed.
 
+Both installers first:
+
+- check what Prism needs, and if anything is missing, stop and print one
+  `sudo dnf install` command for all of it;
 - copy the code to `~/.local/share/prism`, so nothing running ever sees a
   half-edited checkout (`install-common.sh`);
 - the first time, set up the PDF libraries in `.pdf-venv` (about 450 MB from
-  PyPI) with `setup-pdf.sh`.
+  PyPI) with `setup-pdf.sh`;
+- set up REMOVE BG's GPU model with `setup-model.py` (above). What's already
+  in place is checked, not downloaded again.
 
 `install-nautilus.sh` then:
 
