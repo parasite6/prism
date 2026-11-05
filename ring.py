@@ -26,7 +26,6 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote_to_bytes, urlsplit
 
 # Software rendering only. The ring is simple 2D cairo drawing; GTK's default GL
@@ -48,6 +47,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import binding  # noqa: E402
 import convert  # noqa: E402
+import notices  # noqa: E402
 
 if not os.environ.get("XDG_RUNTIME_DIR"):
     sys.exit("prism: XDG_RUNTIME_DIR is not set (refusing to use a shared /tmp)")
@@ -500,8 +500,9 @@ class Ring(Gtk.ApplicationWindow):
             return
         # Formats, compression levels, sizes and edits each live in their own
         # ring, behind one petal: CONVERT, COMPRESS, RESCALE, EDIT (CROP and
-        # ROTATE, which open the edit window); then the direct action CLEAN.
-        actions = [t for t in ("clean",) if t in targets]
+        # ROTATE, which open the edit window); then the direct actions REMOVE BG
+        # and CLEAN.
+        actions = [t for t in ("nobg", "clean") if t in targets]
         groups = {"convert": [t for t in targets if t not in actions
                               and not any(t in group for group in convert.SUBMENUS.values())],
                   **{name: [t for t in targets if t in group] for name, group in convert.SUBMENUS.items()}}
@@ -1005,15 +1006,13 @@ class App(Gtk.Application):
         return True
 
     def start(self, files, ext):
-        """Convert in parallel off the GTK thread, then report."""
+        """Convert in parallel off the GTK thread, with a progress notification."""
         global BUSY
 
         def work():
             global BUSY
             try:
-                with ThreadPoolExecutor(max_workers=min(4, len(files))) as pool:
-                    jobs = [(f, pool.submit(convert.convert_isolated, f, ext)) for f in files]
-                report(jobs, ext)
+                notices.convert_all(files, ext)  # live progress notification, then the result
             finally:
                 with BUSY_LOCK:
                     BUSY -= 1
@@ -1042,31 +1041,6 @@ def open_edit(path, tool):
                           f"--{tool}", path], envp=env, flags=GLib.SpawnFlags.STDOUT_TO_DEV_NULL)
     except GLib.Error as e:
         notify(f"Can't open the {tool} tool", e.message)
-
-
-def report(jobs, ext):
-    done, failed = [], []
-    for f, job in jobs:
-        try:
-            done.append(job.result())
-        except Exception as e:  # report every failure, don't stop the batch
-            failed.append(f"{os.path.basename(f)}: {e}")
-    if done:
-        body = os.path.basename(done[0]) if len(done) == 1 else ""
-        notices = dict.fromkeys(note for result in done for note in result.warnings)
-        body = "\n".join(filter(None, [body, *notices]))
-        files = f"{len(done)} file" + ("s" if len(done) > 1 else "")
-        if ext == "clean":
-            title = f"Cleaned {files} (metadata removed)"
-        elif ext in convert.RESIZE:
-            title = f"Resized {files} to {convert.PERCENT[ext]}%"
-        elif ext in convert.COMPRESS:
-            title = f"Compressed {files} ({convert.LEVEL_NAMES[convert.COMPRESS[ext]].lower()})"
-        else:
-            title = f"Converted {len(done)} to {ext.upper()}"
-        notify(title, body[:400])
-    if failed:
-        notify(f"{len(failed)} failed", "\n".join(failed)[:400])
 
 
 def parse_selection(payload):
@@ -1127,7 +1101,7 @@ if __name__ == "__main__":
     if sys.argv[1:] != ["--daemon"]:
         sys.exit("Run via ring-ctl / the Nautilus script; `ring.py --daemon` starts the resident ring.")
     # Hyprland runs with SIGTERM blocked and children inherit the mask: started
-    # at login, the ring never saw install.sh's or logout's SIGTERM. Unblock
+    # at login, the ring never saw the installer's or logout's SIGTERM. Unblock
     # before any thread starts, so every thread inherits the fixed mask.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
     daemon()

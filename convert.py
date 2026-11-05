@@ -84,7 +84,7 @@ _GIFSICLE = {1: [], 2: ["--lossy=80", "--colors", "192"], 3: ["--lossy=120", "--
              4: ["--lossy=160", "--colors", "64"], 5: ["--lossy=200", "--colors", "32"]}
 SUBMENUS = {"compress": set(COMPRESS), "rescale": set(RESIZE), "edit": {"crop", "rotate"}}
 LABELS = {"half": "\u00bd", "third": "\u2153", "double": "2\u00d7", "clean": "CLEAN", "convert": "CONVERT", "crop": "CROP",
-          "edit": "EDIT", "rotate": "ROTATE",
+          "edit": "EDIT", "rotate": "ROTATE", "nobg": "REMOVE BG",
           "rescale": "RESCALE", "compress": "COMPRESS", "back": "BACK",
           **{t: LEVEL_NAMES[n].upper() for t, n in COMPRESS.items()}}
 BASE = Path(__file__).resolve().parent
@@ -167,6 +167,23 @@ def _compressible(path, probe=True):
     return e in COMPRESSIBLE_AUDIO or (e in COMPRESSIBLE_IMAGE and not (probe and _animated_still_format(path)))
 
 
+# Remove background (cutout.py): plain backdrops only, no AI model. Always saves
+# a PNG, so HEIC needs only libheif's decoder. Animated PNG/AVIF aren't offered;
+# a GIF/WebP animation or a multi-page TIFF gives its first frame.
+CUTOUT_FORMATS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif", "heic", "heif"}
+
+
+@functools.lru_cache(maxsize=None)
+def _cutout_available():
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m in ("numpy", "scipy", "PIL"))
+
+
+def _cuttable(path, probe=True):
+    return (ext_of(path) in CUTOUT_FORMATS and _cutout_available()
+            and not (probe and _animated_still_format(path)))
+
+
 def _croppable(path):
     e = ext_of(path)
     return (e in RESIZABLE_IMAGE and (e not in ("heic", "heif") or _heic_encoder())
@@ -190,6 +207,7 @@ def targets_for(paths):
         sets.append([t for t in TARGETS[kind] if t != own and (t != "heic" or _heic_encoder())]
                     + _resizes(p, probe=n < _RESIZE_PROBES)
                     + (list(COMPRESS) if _compressible(p, probe=n < _RESIZE_PROBES) else [])
+                    + (["nobg"] if _cuttable(p, probe=n < _RESIZE_PROBES) else [])
                     + (["clean"] if _cleanable(p) else []))
     common = [t for t in sets[0] if all(t in s for s in sets[1:])] if sets else []
     if len(paths) == 1 and _croppable(paths[0]):
@@ -498,12 +516,12 @@ def _document(src, ext, out, payload, work):
 
 
 def _pdf_python():
-    # A repo checkout has none of its own: it uses the installed copy's (install.sh).
+    # A repo checkout has none of its own: it uses the installed copy's (install-nautilus.sh or install-dolphin.sh).
     installed = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "prism"
     for python in (BASE / ".pdf-venv/bin/python", installed / ".pdf-venv/bin/python"):
         if python.is_file():
             return python
-    raise RuntimeError("PDF dependencies are missing. Run install.sh (or setup-pdf.sh) first.")
+    raise RuntimeError("PDF dependencies are missing. Run install-nautilus.sh or install-dolphin.sh (or setup-pdf.sh) first.")
 
 
 def _scrub_pdf(path):
@@ -855,6 +873,84 @@ CROP_FORMATS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif
 _PREVIEW_SIDE = 4096  # enough detail for the crop window's zoom; ~64 MB at most
 
 
+# Remove background reports its stages (a batch worker prints them for the
+# progress window): progress(stage, fraction 0..1, kind), kind "file" (this
+# file's work) or "load" (loading the model, once per batch).
+PROGRESS = None
+# A photo's stages, by measured time on an RTX 4060 (warm): reading ~0.4 s,
+# the model pass ~1 s, edges ~0.25 s, saving ~0.6 s.
+_READ, _MODEL, _EDGES = 0.18, 0.61, 0.72
+
+
+def _progress(stage, fraction, kind="file"):
+    if PROGRESS:
+        PROGRESS(stage, max(0.0, min(1.0, fraction)), kind)
+
+
+def _cutout(src, payload, work):
+    """The background made transparent, as a PNG: cutout.py (exact, no model)
+    for flat backdrops, matting.py (the GPU model) for everything else."""
+    import cutout
+    import matting
+    _progress("Reading", 0.0)
+    size = size_of(src)  # header only: refuse what wouldn't fit before decoding it
+    if size and all(size):
+        matting.check_image(*size)
+    image = _decoded(src, work)
+    warnings = []
+    if ext_of(src) in ("gif", "webp", "tif", "tiff"):
+        frames = len(_run(["magick", "identify", "-format", "x", str(image)]).strip())
+        if frames > 1:
+            what = "page" if ext_of(src) in ("tif", "tiff") else "frame"
+            warnings.append(f"Kept the first {what}: PNG stores a still image")
+    # EXIF rotation baked in, sRGB, 8-bit RGBA. Uncompressed TIFF: 3x faster
+    # than a PNG handoff, the same pixels.
+    upright = work / "upright.tif"
+    _run(["magick", f"{image}[0]", *CLEAN, "-depth", "8", "-alpha", "on", "-compress", "none",
+          f"TIFF:{upright}"], timeout=600)
+    import numpy as np
+    from PIL import Image
+    with Image.open(upright) as im:
+        matting.check_image(*im.size)  # the real size, whatever the header said
+        rgba = np.asarray(im.convert("RGBA"))
+    upright.unlink()  # don't hold the disk copy while the GPU works
+    out = None
+    if cutout.is_flat(rgba):  # a logo or screenshot: the exact colour method
+        _progress("Cutting out", 0.4)
+        try:
+            out, _removed = cutout.remove_background(rgba)
+        except cutout.AlreadyTransparent:
+            raise
+        except cutout.NoPlainBackground:
+            out = None  # flat edges but no clean cut (e.g. the subject touches them): the model
+    if out is None:
+        if not matting.available():
+            raise RuntimeError("This picture needs the GPU model (BiRefNet_HR-matting), which isn't set up: "
+                               "see the README; nothing was saved")
+        if matting._model is None:
+            _progress("Loading the model", 0.0, "load")
+            matting.precheck()  # RAM and VRAM, via nvidia-smi: before spending ~4 s importing torch
+            matting.shared(lambda f: _progress("Loading the model", f, "load"))
+        _progress("Finding the subject", _READ)
+
+        def staged(stage, f):  # matting's 0..0.78: the pass; 0.78..1: edges
+            if f <= 0.78:
+                _progress(stage, _READ + (_MODEL - _READ) * f / 0.78)
+            else:
+                _progress(stage, _MODEL + (_EDGES - _MODEL) * (f - 0.78) / 0.22)
+
+        out = matting.remove_background(rgba, staged)
+        save_from = _EDGES
+    else:
+        save_from = 0.7
+    del rgba
+    _progress("Saving", save_from)
+    # Level 1, as Prism's other PNGs: ~3x faster to write for ~10% more size.
+    Image.fromarray(out, "RGBA").save(payload / "cutout.png", compress_level=1)
+    _progress("Saving", 1.0)
+    return warnings
+
+
 def _decoded(src, work):
     """What ImageMagick can read: this build has no AVIF/HEIC decoder; libheif does."""
     if ext_of(src) in ("avif", "heic", "heif"):
@@ -1000,6 +1096,7 @@ def convert(src, ext):
     if resizes and ext not in resizes:  # resizable, but not by this much
         raise RuntimeError(f"Too {'large' if ext == 'double' else 'small'} to resize to {PERCENT[ext]}%")
     if kind is None or not (ext in TARGETS[kind] or (ext == "clean" and _cleanable(src)) or ext in resizes
+                            or (ext == "nobg" and _cuttable(src))
                             or (ext in COMPRESS and _compressible(src))):
         raise RuntimeError("unsupported conversion for this file type")
     if not src.is_file():
@@ -1013,6 +1110,8 @@ def convert(src, ext):
         folder = None
         if ext == "clean":
             warnings = _clean(src, kind, payload, work)
+        elif ext == "nobg":
+            warnings = _cutout(src, payload, work)
         elif ext in RESIZE:
             warnings = _resize(src, kind, ext, payload, work)
         elif ext in COMPRESS:
@@ -1087,6 +1186,8 @@ def convert(src, ext):
         saved = _publish(payload, src, ext, bundle=(kind == "pdf" and ext == "md") or folder is not None,
                          folder=folder, **({"stem": f"{src.stem} (clean)", "suffix": src.suffix}
                                            if ext == "clean" else
+                                           {"stem": f"{src.stem} (no background)", "suffix": ".png"}
+                                           if ext == "nobg" else
                                            {"stem": f"{src.stem} ({PERCENT[ext]}%)", "suffix": src.suffix}
                                            if ext in RESIZE else
                                            {"stem": f"{src.stem} (compressed, {LEVEL_NAMES[COMPRESS[ext]].lower()})",
@@ -1125,8 +1226,84 @@ def convert_isolated(src, ext):
     raise RuntimeError(detail[-1] if detail else f"The conversion stopped unexpectedly ({proc.returncode})")
 
 
+def _cutout_memory():
+    import matting
+    return f"{matting.WORKER_RAM >> 20}M"  # matting.py sizes every image against this cap
+
+
+class Progress(tuple):
+    """A stage update from a batch worker: (stage, fraction 0..1, kind), kind
+    "file" (that file's work), "load" (loading the model) or "release"."""
+    stage = property(lambda self: self[0])
+    fraction = property(lambda self: self[1])
+    kind = property(lambda self: self[2] if len(self) > 2 else "file")
+
+
+def cutout_isolated(files):
+    """Remove background for a whole batch in ONE memory-capped worker, so the
+    GPU model loads once (~5 s) instead of per file. Yields (index, result) as
+    the work goes: a Progress while a file is worked on, then its ConversionResult
+    or RuntimeError. (None, Progress) is batch-wide (releasing the GPU)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")}
+    worker = ["/usr/bin/python3", str(BASE / "convert.py"), "--cutout-batch", *map(str, files)]
+    if shutil.which("systemd-run") and env.get("DBUS_SESSION_BUS_ADDRESS"):
+        worker = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                  "-p", f"MemoryMax={_cutout_memory()}", "-p", "MemorySwapMax=0", "--", *worker]
+    seen = set()
+    with tempfile.TemporaryFile("w+", errors="replace") as err:  # a file: a full stderr pipe would stall the worker
+        proc = subprocess.Popen(worker, env=env, stdout=subprocess.PIPE, stderr=err, text=True, errors="replace")
+        for line in proc.stdout:
+            try:
+                r = json.loads(line)
+                i = r["i"]
+            except (ValueError, TypeError, KeyError):
+                continue  # not one of ours
+            if "stage" in r:
+                kind = r.get("kind", "file")
+                if (kind == "file") != isinstance(i, int) or kind not in ("file", "load", "release") \
+                        or (kind == "file" and not 0 <= i < len(files)):
+                    continue
+                try:
+                    yield (i if kind == "file" else None), Progress((str(r["stage"]), float(r.get("fraction", 1)), kind))
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if not isinstance(i, int) or not 0 <= i < len(files) or i in seen:
+                continue
+            seen.add(i)
+            yield i, (ConversionResult(r["path"], r.get("warnings", ())) if "path" in r
+                      else RuntimeError(r.get("error") or "Remove background failed"))
+        code = proc.wait()
+        err.seek(0)
+        detail = err.read().strip().splitlines()
+    if len(seen) < len(files):
+        sweep_leftovers()  # a killed worker leaves its temp folder behind
+        if code in (-9, 137):
+            why = f"Ran out of memory (removing a background may use {_cutout_memory()}B); nothing was saved"
+        else:
+            why = detail[-1] if detail else f"Remove background stopped unexpectedly ({code})"
+        for i in range(len(files)):
+            if i not in seen:
+                yield i, RuntimeError(why)
+
+
 if __name__ == "__main__":
     import sys
+    if sys.argv[1:2] == ["--cutout-batch"]:
+        os.nice(10)  # background priority, as the other conversions
+        for i, src in enumerate(sys.argv[2:]):
+            PROGRESS = (lambda i: lambda stage, f, kind: print(json.dumps(
+                {"i": i if kind == "file" else None, "stage": stage, "fraction": round(f, 4), "kind": kind}),
+                flush=True))(i)
+            try:
+                saved = convert(src, "nobg")
+                print(json.dumps({"i": i, "path": str(saved), "warnings": list(saved.warnings)}), flush=True)
+            except Exception as e:  # each file reports for itself; the batch goes on
+                print(json.dumps({"i": i, "error": str(e) or type(e).__name__}), flush=True)
+        if "matting" in sys.modules and sys.modules["matting"]._model is not None:
+            print(json.dumps({"i": None, "stage": "Releasing the GPU", "fraction": 0, "kind": "release"}), flush=True)
+            sys.modules["matting"].release()
+        sys.exit(0)
     if sys.argv[1:2] != ["--job"] or len(sys.argv) != 4:
         sys.exit("convert.py --job SRC TARGET  (used by the ring; prints a JSON result)")
     try:

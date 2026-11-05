@@ -1,6 +1,8 @@
 """Integration regressions, using disposable inputs and system conversion tools."""
 import ast
 import concurrent.futures
+import contextlib
+import io
 import importlib.util
 import json
 import hashlib
@@ -419,7 +421,7 @@ class RingMenuTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             png = self.make(tmp, "a.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x04\0\0\0\x03\0\x08\x02\0\0\0")
             obj = self.opened([png])
-            self.assertEqual(obj.targets, ["convert", "compress", "rescale", "edit", "clean"])
+            self.assertEqual(obj.targets, ["convert", "compress", "rescale", "edit", "nobg", "clean"])
             self.assertEqual(obj.menus["edit"], ["back", "crop", "rotate"])
             self.assertEqual(obj.menus["convert"][0], "back")
             self.assertIn("jpg", obj.menus["convert"])
@@ -1054,7 +1056,7 @@ class InstallerTests(unittest.TestCase):
             runtime = folder / "run"; runtime.mkdir()
             env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
                        XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
-            run(["bash", str(ROOT / "install.sh")], env=env)
+            run(["bash", str(ROOT / "install-nautilus.sh")], env=env)
             launcher = folder / "data/nautilus/scripts/Prism"
             self.assertTrue(launcher.is_symlink())
             installed = folder / "data/prism"  # copied there, not run from the repo
@@ -1064,6 +1066,38 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue((folder / "config/nautilus/scripts-accels").is_file())
             desktop = (folder / "data/applications/dev.prism.Bind.desktop").read_text()
             self.assertIn(f'Exec="{installed}/prism-bind"', desktop)
+            self.assertFalse((folder / "data/kio").exists())  # Dolphin's menus come from its own installer
+
+    def test_dolphin_installer_adds_only_the_menus(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            bin_dir = folder / "bin"; bin_dir.mkdir()
+            # Never touch the live session: pgrep finds no ring, hyprctl/nautilus do nothing.
+            for name, code in (("nautilus", 0), ("hyprctl", 0), ("pgrep", 1)):
+                fake = bin_dir / name
+                fake.write_text(f"#!/bin/sh\nexit {code}\n"); fake.chmod(0o755)
+            runtime = folder / "run"; runtime.mkdir()
+            env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), XDG_RUNTIME_DIR=str(runtime), PRISM_SKIP_PDF="1",
+                       XDG_CONFIG_HOME=str(folder / "config"), PATH=f"{bin_dir}:/usr/bin:/bin")
+            menus = folder / "data/kio/servicemenus"; menus.mkdir(parents=True)
+            (menus / "dev.prism.menu-stale.desktop").write_text("x")  # a target since removed
+            (menus / "someone-else.desktop").write_text("x")
+            run(["bash", str(ROOT / "install-dolphin.sh")], env=env)
+            run(["bash", str(ROOT / "install-dolphin.sh")], env=env)  # re-running changes nothing more
+            installed = folder / "data/prism"
+            self.assertTrue((installed / "menu.py").is_file())
+            self.assertFalse((installed / ".git").exists())
+            names = sorted(p.name for p in menus.iterdir())
+            self.assertIn("someone-else.desktop", names)
+            self.assertNotIn("dev.prism.menu-stale.desktop", names)
+            self.assertIn("dev.prism.menu-nobg.desktop", names)
+            self.assertIn("dev.prism.menu-clean.desktop", names)
+            for p in menus.glob("dev.prism.menu-*.desktop"):
+                self.assertIn(str(installed), p.read_text())  # runs the installed copy, not the repo
+            # Nothing of the Nautilus side.
+            self.assertFalse((folder / "data/nautilus").exists())
+            self.assertFalse((folder / "data/applications").exists())
+            self.assertFalse((folder / ".config/hypr/custom.lua").exists())
 
 
     def test_installer_takes_over_from_the_old_name(self):
@@ -1088,8 +1122,8 @@ class InstallerTests(unittest.TestCase):
             (installed / ".pdf-venv/keep").write_text("x")
             (installed / "ring.py").write_text("# an older install")
             (installed / "removed-from-repo.py").write_text("x")
-            run(["bash", str(ROOT / "install.sh")], env=env)
-            run(["bash", str(ROOT / "install.sh")], env=env)  # re-running changes nothing more
+            run(["bash", str(ROOT / "install-nautilus.sh")], env=env)
+            run(["bash", str(ROOT / "install-nautilus.sh")], env=env)  # re-running changes nothing more
             self.assertTrue((installed / ".pdf-venv/keep").is_file())  # never deleted
             self.assertFalse((installed / "removed-from-repo.py").exists())
             self.assertEqual((installed / "ring.py").read_bytes(), (ROOT / "ring.py").read_bytes())
@@ -1105,10 +1139,321 @@ class InstallerTests(unittest.TestCase):
             (target / "notes.txt").write_text("someone else's")
             env = dict(os.environ, HOME=d, XDG_DATA_HOME=str(folder / "data"), PRISM_SKIP_PDF="1",
                        XDG_RUNTIME_DIR=d, XDG_CONFIG_HOME=str(folder / "config"))
-            result = subprocess.run(["bash", str(ROOT / "install.sh")], env=env, capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("isn't a Prism install", result.stderr)
-            self.assertEqual([p.name for p in target.iterdir()], ["notes.txt"])
+            for installer in ("install-nautilus.sh", "install-dolphin.sh"):
+                result = subprocess.run(["bash", str(ROOT / installer)], env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("isn't a Prism install", result.stderr)
+                self.assertEqual([p.name for p in target.iterdir()], ["notes.txt"])
+
+
+class DolphinMenuTests(unittest.TestCase):
+    """Dolphin's right-click menus (menu.py): matched the way KIO matches them,
+    i.e. by MIME inheritance (kfileitemactions.cpp mimeTypeListContains)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import configparser
+        import menu
+        cls.menu = menu
+        cls.parents = {}
+        with open("/usr/share/mime/subclasses") as f:
+            for line in f:
+                c, par = line.split()
+                cls.parents.setdefault(c, set()).add(par)
+        cls.entries = []
+        for name, text in menu.dolphin_menus().items():
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            cp.optionxform = str
+            cp.read_string(text)
+            cls.entries.append((name, cp))
+
+    def ancestors(self, m):
+        out, todo = {m}, [m]
+        while todo:
+            for par in self.parents.get(todo.pop(), ()):
+                if par not in out:
+                    out.add(par)
+                    todo.append(par)
+        return out
+
+    def shown(self, mime):
+        anc = self.ancestors(mime)
+        hits = []
+        for name, cp in self.entries:
+            e = cp["Desktop Entry"]
+            types = [t for t in e["MimeType"].split(";") if t]
+            excluded = [t for t in e.get("ExcludeServiceTypes", "").split(",") if t]
+            if any(t in anc for t in types) and not any(t in anc for t in excluded):
+                hits.append((name, cp))
+        return hits
+
+    def test_no_menus_on_text_subtypes_and_no_duplicates(self):
+        # text/plain (.txt) once put Convert on every script/config/CSV, and CSV
+        # got PDF/PNG/JPG twice (doc + sheet).
+        for mime in ("text/x-python3", "application/json", "application/x-shellscript", "video/ogg"):
+            self.assertEqual(self.shown(mime), [], mime)
+        with open("/usr/share/mime/types") as f:
+            types = [l.strip() for l in f if l.strip()]
+        for mime in types:
+            seen = set()
+            for _name, cp in self.shown(mime):
+                e = cp["Desktop Entry"]
+                for action in filter(None, e["Actions"].split(";")):
+                    key = (e.get("X-KDE-Submenu", ""), action)
+                    self.assertNotIn(key, seen, f"{mime}: {key} listed twice")
+                    seen.add(key)
+
+    def test_expected_menus_still_show(self):
+        names = lambda m: sorted(n.removeprefix("dev.prism.menu-").removesuffix(".desktop") for n, _ in self.shown(m))
+        self.assertEqual(names("text/csv"), ["convert-sheet"])
+        self.assertIn("convert-doc", names("text/plain"))
+        self.assertEqual(names("image/png"), ["clean", "compress", "convert-image", "edit", "nobg", "rescale"])
+        self.assertNotIn("nobg", names("image/svg+xml"))  # vector: not a pixel backdrop
+
+    def test_every_menu_is_local_executable_and_complete(self):
+        for name, cp in self.entries:
+            e = cp["Desktop Entry"]
+            self.assertEqual(e["X-KDE-Protocol"], "file", name)  # never sftp/smb temp copies
+            for action in filter(None, e["Actions"].split(";")):
+                section = cp[f"Desktop Action {action}"]
+                self.assertTrue(section["Exec"].endswith(f" {action} %F"), name)
+                self.assertTrue(section["Icon"] and section["Name"], name)
+        with tempfile.TemporaryDirectory() as d:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.menu.write_dolphin_menus(d)
+            for f in Path(d).iterdir():
+                self.assertTrue(os.access(f, os.X_OK), f)  # KIO skips non-executable user menus
+
+    def test_run_refuses_targets_that_dont_apply(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(self.menu, "notify") as notify, \
+                patch.object(convert, "convert_isolated") as conv:
+            png = Path(d) / "a.png"
+            run(["magick", "-size", "8x8", "xc:red", str(png)])
+            self.assertEqual(self.menu.run("png", [str(png)]), 1)  # already PNG
+            self.assertEqual(self.menu.run("jpg", [d]), 1)  # a folder
+            conv.assert_not_called()
+            self.assertEqual(notify.call_count, 2)
+
+
+class _NoWindow:
+    """Stands in for notices.ProgressWindow when the window can't open."""
+    ok = False
+
+    def update(self, **msg):
+        raise AssertionError("no window to update")
+
+    def close(self):
+        pass
+
+
+class _FakeWindow:
+    ok = True
+
+    def __init__(self):
+        self.updates, self.closed = [], False
+
+    def update(self, **msg):
+        self.updates.append(msg)
+
+    def close(self):
+        self.closed = True
+
+
+class ProgressNoticeTests(unittest.TestCase):
+    """notices.convert_all: progress in Prism's window, or one live notification
+    when the window can't open; results as notifications either way."""
+
+    def setUp(self):
+        import notices
+        patcher = patch.object(notices, "ProgressWindow", _NoWindow)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_progress_window_then_result_notification(self):
+        import notices
+        calls, window = [], _FakeWindow()
+        with patch.object(notices, "send", lambda *a, **k: calls.append((a, k)) or 5):
+            def work(src, ext):
+                if src == "bad.png":
+                    raise RuntimeError("broken")
+                return convert.ConversionResult("/x/a.jpg")
+            notices.convert_all(["a.png", "bad.png"], "jpg", work, window=window)
+        first = window.updates[0]
+        self.assertEqual((first["title"], first["done"], first["total"], first["fraction"]),
+                         ("Converting 2 files to JPG", 0, 2, 0.0))
+        self.assertEqual(sorted(u["done"] for u in window.updates[1:]), [1, 2])
+        self.assertIn(("bad.png", "\u2717 Failed"), [(u["file"], u["stage"]) for u in window.updates[1:]])
+        self.assertEqual(max(u["fraction"] for u in window.updates), 1.0)
+        self.assertTrue(window.closed)
+        titles = [c[0][0] for c in calls]
+        self.assertEqual(titles, ["Converted 1 to JPG", "1 failed"])  # no progress notifications
+
+    def test_remove_background_stages_move_the_bar(self):
+        """Stages move the bar in proportion to real time: loading the model
+        counts as two photos, and releasing the GPU is the last step."""
+        import notices
+        window = _FakeWindow()
+
+        def fake_batch(files):
+            P = convert.Progress
+            yield None, P(("Loading the model", 0.3, "load"))
+            yield None, P(("Loading the model", 1.0, "load"))
+            yield 0, P(("Finding the subject", 0.7, "file"))
+            yield 0, convert.ConversionResult("/x/a (no background).png")
+            yield 1, P(("Refining edges", 0.5, "file"))
+            yield 1, convert.ConversionResult("/x/b (no background).png")
+            yield None, P(("Releasing the GPU", 0.0, "release"))
+
+        with patch.object(convert, "cutout_isolated", fake_batch), patch.object(notices, "send", lambda *a, **k: 1):
+            notices.convert_all(["a.jpg", "b.jpg"], "nobg", window=window)
+        steps = [(u.get("stage"), round(u["fraction"], 4)) for u in window.updates]
+        self.assertEqual(steps, [("Starting", 0.0), ("Loading the model", 0.147), ("Loading the model", 0.49),
+                                 ("Finding the subject", 0.6615), ("\u2713 Done", 0.735),
+                                 ("Refining edges", 0.8575), ("\u2713 Done", 0.98), ("Releasing the GPU", 0.98)])
+
+    def test_flat_only_batch_drops_the_model_share(self):
+        import notices
+        window = _FakeWindow()
+
+        def fake_batch(files):
+            yield 0, convert.Progress(("Cutting out", 0.4, "file"))
+            yield 0, convert.ConversionResult("/x/logo (no background).png")
+
+        with patch.object(convert, "cutout_isolated", fake_batch), patch.object(notices, "send", lambda *a, **k: 1):
+            notices.convert_all(["logo.png"], "nobg", window=window)
+        self.assertEqual(round(window.updates[-1]["fraction"], 3), 0.98)  # not stuck at a third
+
+
+class RemoveBackgroundTests(unittest.TestCase):
+    """cutout.py: plain backdrops become transparent; busy ones are refused."""
+
+    def setUp(self):
+        import cutout
+        import numpy
+        self.cutout, self.np = cutout, numpy
+
+    def logo(self):
+        """A red ring on white, antialiased: the hole must go too."""
+        np = self.np
+        y, x = np.mgrid[:120, :160]
+        r = np.hypot(x - 80, y - 60)
+        cover = np.clip(40 - r, 0, 1) * np.clip(r - 20, 0, 1)  # 1 px soft edge both sides
+        rgb = (1 - cover[..., None]) * 255 + cover[..., None] * np.array([200, 30, 40])
+        return np.dstack([rgb, np.full(r.shape, 255)]).round().astype(np.uint8)
+
+    def test_logo_on_white(self):
+        out, removed = self.cutout.remove_background(self.logo())
+        a = out[..., 3]
+        self.assertEqual((a[0, 0], a[60, 80], a[60, 50]), (0, 0, 255))  # corner, hole, ring
+        edge = (a > 20) & (a < 235)
+        self.assertTrue(edge.any())
+        green = out[..., 1][edge].astype(int)
+        self.assertGreater((green < 90).mean(), 0.9, "white fringe left on the edge")
+        self.assertTrue(0.5 < removed < 0.9)
+
+    def test_busy_background_is_refused(self):
+        noise = self.np.random.default_rng(1).integers(0, 255, (80, 80, 4), dtype=self.np.uint8)
+        noise[..., 3] = 255
+        with self.assertRaises(self.cutout.NoPlainBackground):
+            self.cutout.remove_background(noise)
+
+    def test_already_transparent_is_refused(self):
+        with self.assertRaises(self.cutout.NoPlainBackground):
+            self.cutout.remove_background(self.np.zeros((40, 40, 4), self.np.uint8))
+
+    def test_offered_and_saved_as_png(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "logo.jpg"
+            Image.fromarray(self.logo()[..., :3]).save(src, quality=90)
+            self.assertIn("nobg", convert.targets_for([str(src)]))
+            saved = convert.convert(str(src), "nobg")
+            self.assertEqual(Path(saved).name, "logo (no background).png")
+            with Image.open(saved) as im:
+                self.assertEqual(im.mode, "RGBA")
+                self.assertEqual(im.getpixel((0, 0))[3], 0)
+            self.assertNotIn("nobg", convert.targets_for([str(Path(d) / "a.svg")]))
+
+    def test_photos_go_to_the_model_flat_graphics_dont(self):
+        np = self.np
+        self.assertTrue(self.cutout.is_flat(self.logo()))
+        photo = np.random.default_rng(2).normal(128, 20, (90, 120, 3)).clip(0, 255).astype(np.uint8)
+        self.assertFalse(self.cutout.is_flat(np.dstack([photo, np.full(photo.shape[:2], 255, np.uint8)])))
+
+
+class MattingSafetyTests(unittest.TestCase):
+    """matting.py refuses rather than push RAM or VRAM into trouble."""
+
+    def setUp(self):
+        import matting
+        import notices
+        self.m = matting
+        patcher = patch.object(notices, "ProgressWindow", _NoWindow)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_low_ram_is_refused_before_decoding(self):
+        with patch.object(self.m, "ram_available", return_value=4 * self.m.GIB):
+            with self.assertRaisesRegex(RuntimeError, "Not enough free RAM"):
+                self.m.check_image(6000, 4000)  # 24 MP: 1.1 GB, with 3 GB kept free > 4 GB
+            self.m.check_image(1000, 1000)  # small: fine
+
+    def test_oversized_image_is_refused(self):
+        with patch.object(self.m, "ram_available", return_value=1 << 40):
+            with self.assertRaisesRegex(RuntimeError, "Too large"):
+                self.m.check_image(12000, 9000)
+        # it fits under the worker's own cap
+        self.assertLess(self.m.RAM_BASE + self.m.MAX_PIXELS * self.m.RAM_PER_PX, self.m.WORKER_RAM)
+
+    def test_busy_gpu_is_refused_before_starting(self):
+        with patch.object(self.m, "available", return_value=True), \
+                patch.object(self.m, "ram_available", return_value=1 << 40), \
+                patch.object(self.m, "gpu_free_quick", return_value=2 * self.m.GIB):
+            with self.assertRaisesRegex(RuntimeError, "GPU is busy"):
+                self.m.precheck()
+        with patch.object(self.m, "available", return_value=True), \
+                patch.object(self.m, "ram_available", return_value=1 << 40), \
+                patch.object(self.m, "gpu_free_quick", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "NVIDIA GPU"):
+                self.m.precheck()
+
+    def test_a_batch_runs_in_one_worker(self):
+        import notices
+        calls = []
+
+        def fake_batch(files):
+            calls.append(list(files))
+            yield 1, RuntimeError("busy")
+            yield 0, convert.ConversionResult("/x/a (no background).png")
+
+        with patch.object(convert, "cutout_isolated", fake_batch), patch.object(notices, "send", lambda *a, **k: 1):
+            done, failed = notices.convert_all(["a.jpg", "b.jpg"], "nobg")
+        self.assertEqual(calls, [["a.jpg", "b.jpg"]])
+        self.assertEqual(done, ["/x/a (no background).png"])
+        self.assertEqual(failed, ["b.jpg: busy"])
+
+    def test_banded_edges_match_one_pass(self):
+        """Edge refinement split into bands gives the same pixels (needs CUDA)."""
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        if not torch.cuda.is_available():
+            self.skipTest("no CUDA GPU")
+        import numpy as np
+        model = self.m.Model.__new__(self.m.Model)  # the band logic only, no weights
+        model.torch, model.cap = torch, 1 << 40
+        rng = np.random.default_rng(3)
+        h, w = 700, 300
+        with torch.inference_mode():
+            image = torch.from_numpy(rng.integers(0, 255, (3, h, w), dtype=np.uint8)).cuda()
+            alpha = torch.from_numpy(rng.random((1, h, w), dtype=np.float32)).cuda()
+            model.spare = lambda: 1 << 40
+            one = model._foreground(image, alpha)
+            model.spare = lambda: (80 + 2 * self.m.BAND_MARGIN) * w * self.m.FUSION_PER_PX
+            banded = model._foreground(image, alpha)
+        self.assertTrue(np.array_equal(one, banded))
+
 
 if __name__ == "__main__":
     unittest.main()
