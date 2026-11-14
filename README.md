@@ -9,16 +9,17 @@ the original.
 - **Dolphin**: the same actions as right-click menus.
 - **Strata**: the same actions in the right-click **Actions** menu.
 
+## Nautilus: the ring 
 ```sh
-curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-nautilus.sh | bash   # Nautilus: the ring
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-nautilus.sh | bash
 ```
-
+## Dolphin: right-click menus 
 ```sh
-curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-dolphin.sh | bash    # Dolphin: right-click menus
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-dolphin.sh | bash
 ```
-
+## Strata: right-click actions 
 ```sh
-curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-strata.sh | bash     # Strata: right-click actions
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-strata.sh | bash
 ```
 
 ## Contents
