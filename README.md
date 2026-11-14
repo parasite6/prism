@@ -7,6 +7,7 @@ the original.
 - **Nautilus**: select files, hold the mouse **Forward** button, and a ring of
   options opens under the pointer. Release over one to run it.
 - **Dolphin**: the same actions as right-click menus.
+- **Strata**: the same actions in the right-click **Actions** menu.
 
 ```sh
 curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-nautilus.sh | bash   # Nautilus: the ring
@@ -16,13 +17,18 @@ curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-n
 curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-dolphin.sh | bash    # Dolphin: right-click menus
 ```
 
+```sh
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-strata.sh | bash     # Strata: right-click actions
+```
+
 ## Contents
 
 - [1. Using it](#using-it)
   - [1.1 The ring (Nautilus)](#the-ring-nautilus)
   - [1.2 Right-click menus (Dolphin)](#right-click-menus-dolphin)
-  - [1.3 Choosing the shortcut](#choosing-the-shortcut)
-  - [1.4 Progress and results](#progress-and-results)
+  - [1.3 Right-click actions (Strata)](#right-click-actions-strata)
+  - [1.4 Choosing the shortcut](#choosing-the-shortcut)
+  - [1.5 Progress and results](#progress-and-results)
 - [2. What it does](#what-it-does)
   - [2.1 Convert](#convert)
   - [2.2 Compress](#compress)
@@ -85,6 +91,24 @@ and Forward stays Dolphin's own. The same actions are right-click submenus:
 Dolphin menus nest one level and are picked by file type only. So an action
 that doesn't fit the exact selection (PNG to PNG, ½ of a tiny image) says so
 in a notification. The menus are generated from `convert.py` by `menu.py`.
+
+### Right-click actions (Strata)
+
+Strata gets the same actions as custom actions, under right-click > **Actions**.
+Strata can't give them submenus of their own, so they're one flat list with
+short names that sort into groups:
+
+- **Convert to …** (one per format), **Compress 1 · Light** to **5 · Max**,
+  **Rescale to ½ / ⅓ / 2×**, and **Crop…** and **Rotate…** (one image)
+- **Remove background** and **Clean metadata**
+
+Each action lists the exact extensions it applies to, so a PNG never offers
+PNG. An action still shows for a mixed selection when every file has a listed
+type. If the action doesn't fit that exact selection (½ of a tiny image, for
+example), a notification says so. The actions are generated from `convert.py`
+by `menu.py` into `~/.config/strata/actions/dev.prism.*`. They show up in
+**Settings > Actions**, where you can turn them off one by one or bind the
+first ten to keys.
 
 ### Choosing the shortcut
 
@@ -281,7 +305,7 @@ fit; banded output is identical to a single pass.
 ### Requirements
 
 - Fedora with Hyprland 0.56+ (Lua config)
-- Nautilus or Dolphin
+- Nautilus, Dolphin or Strata
 - The packages below:
 
 ```sh
@@ -305,12 +329,13 @@ You don't have to check these yourself: the installers do, and print one
 
 ### Running the installer
 
-Run the installer for your file manager as yourself, not root. Run both if you
-use both. Each one fetches Prism on its own:
+Run the installer for your file manager as yourself, not root. Run more than one if
+you use more than one. Each one fetches Prism on its own:
 
 ```sh
 curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-nautilus.sh | bash
 curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-dolphin.sh | bash
+curl -fsSL https://github.com/parasite6/prism/releases/latest/download/install-strata.sh | bash
 ```
 
 To read it first, download it, then run it:
@@ -326,6 +351,7 @@ Or from a clone:
 git clone https://github.com/parasite6/prism && cd prism
 ./install-nautilus.sh   # Nautilus: the ring
 ./install-dolphin.sh    # Dolphin: right-click menus
+./install-strata.sh     # Strata: right-click actions
 ```
 
 Re-run the same installer to update.
@@ -333,11 +359,11 @@ Re-run the same installer to update.
 - Run on its own, an installer clones Prism into a temporary folder (removed
   afterwards) and runs from there. `PRISM_REF` picks a tag or branch.
 - `install.sh` remains for Prism 0.1's one-line installer. It runs the Nautilus
-  installer, plus the Dolphin one if Dolphin's menus are already installed.
+  installer, plus the Dolphin and Strata ones if their menus are already installed.
 
 ### What the installers do
 
-**Both installers** (shared code in `install-common.sh`):
+**All the installers** (shared code in `install-common.sh`):
 
 1. Check what Prism needs. If anything is missing, stop and print one
    `sudo dnf install` command for all of it.
@@ -361,6 +387,13 @@ Re-run the same installer to update.
 (`menu.py --dolphin-menus`, into `~/.local/share/kio/servicemenus`), replacing
 any it made before. It changes nothing else: no ring, binding or Hyprland
 config. If the Nautilus ring is also installed, it restarts it on the new code.
+
+**`install-strata.sh`** then generates Strata's custom actions
+(`menu.py --strata-actions`, into `~/.config/strata/actions`), one owner-only
+`dev.prism.<target>/action.toml` per target, replacing any it made before.
+Each one is a command action that runs `menu.py` on the selection. It changes
+nothing else: no ring, binding or Hyprland config. Strata reads the new actions
+the next time a menu opens, so it doesn't need a restart.
 
 Everything runs on `/usr/bin/python3`, so other Pythons on `PATH` are never
 picked up.
@@ -408,8 +441,8 @@ prism/
 │   ├── hypr-binds.lua ........ Hyprland rules: autostart, blur, binding
 │   ├── bind.py, prism-bind ... Prism: Set Shortcut
 │   └── binding.py ............ reads and writes binding.json
-├── Menus (Dolphin)
-│   └── menu.py ............... runs one action; generates the service menus
+├── Menus (Dolphin, Strata)
+│   └── menu.py ............... runs one action; generates the menus and actions
 ├── Converters
 │   ├── convert.py ............ targets, conversions and the worker
 │   ├── gif_convert.py ........ parallel FFmpeg GIF encoding
@@ -430,6 +463,7 @@ prism/
 ├── Install
 │   ├── install-nautilus.sh
 │   ├── install-dolphin.sh
+│   ├── install-strata.sh
 │   ├── install-common.sh ..... shared steps
 │   ├── install.sh ............ Prism 0.1 compatibility
 │   ├── setup-pdf.sh .......... PDF libraries (.pdf-venv)

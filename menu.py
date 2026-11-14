@@ -3,6 +3,7 @@
 
     menu.py <target> <file>...      run one target (png, compress3, half, clean, crop, ...)
     menu.py --dolphin-menus <dir>   write Dolphin service menus for every target into <dir>
+    menu.py --strata-actions <dir>  write Strata custom actions for every target into <dir>
 
 Dolphin service menus nest one level only, so the ring's groups become top-level
 submenus: Prism Convert, Prism Compress, Prism Rescale, Prism Edit, plus Prism Clean.
@@ -196,6 +197,93 @@ def dolphin_menus():
     return {f"{PREFIX}{name}.desktop": text for name, text in menus.items() if text}
 
 
+# --- Strata custom actions -------------------------------------------------
+# Strata custom actions can't have submenus of their own: Strata puts each one
+# either in the menu body or in its single "Actions" submenu, sorted by name.
+# So each target is one action under Actions, with a short name that sorts
+# into its group. Unlike a Dolphin menu, an action can list exact extensions, so each
+# one shows only on files Prism offers it for.
+
+STRATA_PREFIX = "dev.prism."  # every generated action folder starts with this (install-strata.sh replaces them all)
+# Strata only bundles a few icons (Lucide slugs); unknown ones fall back to a default.
+STRATA_ICONS = {"half": "scale", "third": "scale", "double": "scale", "crop": "scissors",
+                "rotate": "refresh", "nobg": "image", "clean": "check"}
+
+
+def strata_name(target):
+    """Short labels: Strata's menu is narrow and middle-truncates long ones. No
+    "Prism" prefix (the description says it). Strata sorts by name, hence the
+    numbered compress levels."""
+    if target in convert.COMPRESS:
+        level = convert.COMPRESS[target]
+        return f"Compress {level} · {convert.LEVEL_NAMES[level]}"
+    if target in convert.RESIZE:
+        return f"Rescale to {convert.LABELS[target]} ({convert.PERCENT[target]}%)"
+    if target in ("crop", "rotate"):
+        return f"{target.capitalize()}…"  # opens the edit window
+    return {"clean": "Clean metadata", "nobg": "Remove background"}.get(
+        target, f"Convert to {target.upper()}")
+
+
+def strata_actions():
+    """{folder name: action.toml}. Extensions per target come from asking
+    convert.targets_for() about one file of each type, so they follow the ring."""
+    exts = set(convert.CLEANABLE)
+    for kind in ("IMAGE", "VIDEO", "AUDIO", "DOC", "SHEET", "SLIDES", "PDF"):
+        exts |= getattr(convert, kind)
+    offered = {}  # target -> extensions
+    for ext in sorted(exts):
+        for t in convert.targets_for([f"/nonexistent/file.{ext}"]):
+            offered.setdefault(t, []).append(ext)
+    q = lambda s: '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'  # TOML basic string
+    actions = {}
+    for t, ext_list in offered.items():
+        icon = "file-archive" if t in convert.COMPRESS else STRATA_ICONS.get(t, "copy")
+        lines = [
+            "schema_version = 1",
+            f"id = {q(STRATA_PREFIX + t)}",
+            f"name = {q(strata_name(t))}",
+            f"description = {q('Prism: ' + describe(t) + ', saved next to the original')}",
+            f"icon = {q(icon)}",
+            "enabled = true",
+            'menu = "submenu"',
+            "",
+            "[when]",
+            'kinds = ["file"]',
+            f"extensions = [{', '.join(q(e) for e in ext_list)}]",
+            "min_items = 1",
+        ]
+        if t in ("crop", "rotate"):
+            lines.append("max_items = 1")  # the edit window takes one image
+        lines += [
+            "",
+            "[run]",
+            'runtime = "command"',
+            'program = "/usr/bin/python3"',
+            f'args = [{q(os.path.join(HERE, "menu.py"))}, {q(t)}, "{{paths}}"]',
+            'mode = "whole-selection"',
+            'working_directory = "parent"',
+            "confirm = false",
+        ]
+        actions[STRATA_PREFIX + t] = "\n".join(lines) + "\n"
+    return actions
+
+
+def write_strata_actions(folder):
+    """One owner-only folder per action, as Strata itself writes them."""
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for name, text in strata_actions().items():
+        path = os.path.join(folder, name)
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+        tmp = os.path.join(path, "action.toml.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(path, "action.toml"))
+        print(path)
+
+
 def write_dolphin_menus(folder):
     os.makedirs(folder, exist_ok=True)
     for name, text in dolphin_menus().items():
@@ -211,16 +299,23 @@ def write_dolphin_menus(folder):
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--dolphin-menus":
         write_dolphin_menus(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--strata-actions":
+        write_strata_actions(sys.argv[2])
     elif len(sys.argv) >= 3 and not sys.argv[1].startswith("-"):
         # Exit 0 even when nothing was done: Dolphin starts each action as a
         # systemd unit (app-dev.prism.menu-*@….service), and a non-zero exit marks
         # it failed, which failed-unit watchers report as a system fault. The
         # notification is the report; tracebacks still go to the journal.
+        # Strata (which sets STRATA_ACTION_ID) runs no unit: there the exit status
+        # is what its Jobs list shows as done or failed, so report it truthfully.
+        status = 1
         try:
-            run(sys.argv[1], sys.argv[2:])
+            status = run(sys.argv[1], sys.argv[2:])
         except Exception as e:  # started from a menu: no terminal, so say it out loud
             notify(f"Prism: {describe(sys.argv[1])} failed", f"{type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
+        if os.environ.get("STRATA_ACTION_ID"):
+            sys.exit(status)
     else:
         sys.exit(__doc__)

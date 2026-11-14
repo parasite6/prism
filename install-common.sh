@@ -1,11 +1,11 @@
-# Shared by install-nautilus.sh and install-dolphin.sh (sourced, not run).
+# Shared by install-nautilus.sh, install-dolphin.sh and install-strata.sh (sourced, not run).
 # Copies the repo to ~/.local/share/prism, so half-finished edits in the repo
 # never reach the running code, then re-runs the calling installer from there.
 # After that, sets up the PDF libraries the first time.
 DIR="${XDG_DATA_HOME:-$HOME/.local/share}/prism"
 
 # What Prism needs, as command -> Fedora package. Everything missing is reported
-# at once, with one command to install it. $1: nautilus or dolphin.
+# at once, with one command to install it. $1: nautilus, dolphin or strata.
 prism_deps() {
     [[ -n "${PRISM_SKIP_DEPS:-}" ]] && return 0
     [[ $EUID -ne 0 ]] || { echo "Run this as yourself, not root (no sudo): Prism installs into your home folder." >&2; exit 1; }
@@ -16,11 +16,11 @@ prism_deps() {
         [heif-dec]=libheif-tools [wl-copy]=wl-clipboard [notify-send]=libnotify [flock]=util-linux-core
         [systemd-run]=systemd
     )
-    if [[ "$1" == nautilus ]]; then
-        need+=([nautilus]=nautilus [hyprctl]=hyprland)
-    else
-        need+=([dolphin]=dolphin)
-    fi
+    case "$1" in
+        nautilus) need+=([nautilus]=nautilus [hyprctl]=hyprland) ;;
+        dolphin) need+=([dolphin]=dolphin) ;;
+        # strata: not a Fedora package; install-strata.sh only warns when it's missing.
+    esac
     local missing=() cmd
     for cmd in "${!need[@]}"; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("${need[$cmd]}")
